@@ -1,5 +1,6 @@
 import ast
 import time
+import sqlite3
 
 from requests_html import HTMLSession
 
@@ -39,12 +40,44 @@ class Scraper(object):
                 for li_element in li_elements:
                     a_elements = li_element.find("a")
                     for a_element in a_elements:
-                        if "href" in a_element.attrs:
+                        if "href" in a_element.attrs and len(a_element.attrs["href"]) > 0:
                             categories[a_element.attrs["title"]] = a_element.attrs["href"]
 
         
         return categories
     
+    def get_subcategories(self):
+        conn = sqlite3.connect("./data/data.db")
+        c = conn.cursor()
+
+        index = 1
+        for name, url in self.get_categories().items():
+            # c.execute("INSERT INTO categories VALUES (?, ?)", (name, url))
+
+            try:
+                session = HTMLSession()
+                response = session.get(url)
+            except requests.exceptions.RequestException as e:
+                print(e)
+                return None
+
+            if response.status_code != 200:
+                return None
+
+            a_elements = response.html.xpath("//div[@class='categories']/div/div/ul[@class='items']/li/a")
+
+            for a_el in a_elements:
+                sub_name = a_el.text
+                sub_url = self.url[:-1] + a_el.attrs["href"]
+
+                print(sub_name, sub_url, index)
+                # c.execute("INSERT INTO subcategories VALUES (?, ?, ?)", (sub_name, sub_url, index))
+            
+            index += 1
+        
+        conn.commit()
+        conn.close()
+
     def get_products(self, product_url, limit=10):
         products = {}
         for i in range(1, limit+1):
@@ -144,7 +177,7 @@ if __name__ == "__main__":
 
     scraper = Scraper()
     # https://www.hepsiburada.com/ev-elektronik-urunleri-c-2147483638
-    print(scraper.get_products("https://www.hepsiburada.com/pet-shop-c-2147483616", 1))
+    scraper.get_subcategories()
 
     end = time.time()
     print(end - start)
