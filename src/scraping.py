@@ -1,13 +1,9 @@
-from fake_useragent import UserAgent
-from time import sleep
-from urllib.parse import urlparse
-from requests_html import AsyncHTMLSession
+from requests_html import AsyncHTMLSession, HTMLSession
+from requests import Response
 
 import random
 import sqlite3
 import requests
-from requests import Response
-import re
 import csv
 import ast
 import time
@@ -18,19 +14,20 @@ with open("./input/proxylist.csv", "r") as f:
     for row in reader:
         proxy_list.append(row[0])
 
-ua = UserAgent()
+
 MAIN_URL = "https://www.hepsiburada.com/"
 MAX_THREADS = 10
+TIMEOUT = 3
 
 
-class Crawler(object):
+class Scraper(object):
 
     def __init__(self, database: str):
-        self.session = AsyncHTMLSession
+        self.session = HTMLSession()
+        self.asession = AsyncHTMLSession()
         self.database = database
 
         self.queries = []
-
         self.use_proxy = False
     
     def random_proxy(self):
@@ -44,6 +41,7 @@ class Crawler(object):
         while True:
             proxy = random.choice(proxy_candidates)
             self.session.proxies = {"https": proxy, "http": proxy}
+            self.asession.proxies = {"https": proxy, "http": proxy}
 
             if not verify:
                 return
@@ -54,36 +52,11 @@ class Crawler(object):
                 print("Error")
                 pass
 
-    async def crawl(self, url: str) -> Response:
+    def get_categories(self) -> dict:
         if self.use_proxy is True:
-            self.session.headers = {"User-Agent", ua.random}
             self.set_proxy()
 
-            while True:
-                try:
-                    response = await self.session.get(url, timeout=3)
-                    break
-                except requests.exceptions.RequestException as e:
-                    print(e)
-
-                    # self.session.headers = {'User-Agent': ua.random}
-                    self.set_proxy(verify=True)
-                    sleep(0.1)
-        else:
-            try:
-                response = self.session.get(url, timeout=3)
-            except requests.exceptions.RequestException as e:
-                print(e)
-                return None
-        
-        if response.status_code == 200:
-            return response
-        else:
-            print(response.status_code)
-            return None
-        
-    async def get_categories(self) -> dict:
-        response = await self.crawl(MAIN_URL)
+        response = self.session.get(MAIN_URL)
 
         section_elements = response.html.find("section")
 
@@ -109,53 +82,33 @@ class Crawler(object):
 
         
         return categories
-    
-    async def create_subcategory(self, name: str, url: str, index: int) -> None:
-        self.queries.append(("INSERT INTO categories VALUES (?, ?)", (name, url)))
-
-        response = await self.crawl(url)
-
-        a_elements = response.html.xpath("//div[@class='categories']/div/div/ul[@class='items']/li/a")
-        for a_el in a_elements:
-            sub_name = a_el.text
-            sub_url = MAIN_URL[:-1] + a_el.attrs["href"]
-
-            self.queries.append(("INSERT INTO subcategories VALUES (?, ?, ?)", (sub_name, sub_url, index)))
 
     def create_subcategories(self):
-        threads = []
+        if self.proxy_request is True:
+            self.set_proxy()
+
         index = 1
         for name, url in self.get_categories().items():
-            if len(threads) == MAX_THREADS:
-                for t in threads:
-                    t.join()
-                threads = []
+            with sqlite3.connect(self.database) as conn:
+                c = conn.cursor()
+                c.execute("INSERT INTO categories VALUES (?, ?)", (name, url))
 
-            thread = threading.Thread(
-                target = self.create_subcategory, 
-                args=(name, url, index)
-            )
-            thread.start()
-            threads.append(thread)
+                response = self.session.get(url)
+
+                a_elements = response.html.xpath("//div[@class='categories']/div/div/ul[@class='items']/li/a")
+                for a_el in a_elements:
+                    sub_name = a_el.text
+                    sub_url = MAIN_URL[:-1] + a_el.attrs["href"]
+
+                    c.execute("INSERT INTO subcategories VALUES (?, ?, ?)", (sub_name, sub_url, index))
+                
+                conn.commit()
 
             index += 1
-        
-        # Wait for the remaining threads
-        for t in threads:
-            t.join()
-        
-        with sqlite3.connect(self.database) as conn:
-            c = conn.cursor()
 
-            for query in self.queries:
-                c.execute(*query)
-            
-            self.queries = []
-            conn.commit()
-
-    def get_product(self, url: str, subcategory_id: int, brand_id: int=None) -> None:
-        # Getting the response from the url
-        response = self.crawl(url)
+    async def get_product(self, url: str, subcategory_id: int, brand_id: int=None) -> None:
+        response = await self.asession.get(url)
+        print(response.html)
 
         # Searching for the button that have almost all info we need
         xpath = '//button[@class="add-to-basket button small"]'
@@ -206,7 +159,6 @@ class Crawler(object):
                 query = "SELECT * FROM products WHERE product_id = ?;"
                 c.execute(query, (p_id,))
                 last_product = c.fetchone()
-        
                 if last_product is None:
                     self.queries.append((
                         "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (
@@ -225,45 +177,35 @@ class Crawler(object):
                         (p_price, p_id)
                     ))
 
-    def get_products(self, url: str, subcategory_id: int, brand_id: int=None, limit: int=10) -> None:
-        # Getting the response from the url
-        response = self.crawl(url)
+    def get_products(self, url: str, subcategory_id: int, brand_id: int=None) -> None:
+        if self.use_proxy is True:
+            self.set_proxy()
+
+        response = self.session.get(url)
 
         xpath = "//div[@id='pagination']/ul/li/a"
         a_elements = response.html.xpath(xpath)
 
         max_pages = int(a_elements[-1].attrs["class"][0].lstrip("page-"))
+        print(max_pages)
 
-        threads = []
+        run = []
         for i in range(1, max_pages+1):
-            if i > 1:
-                current_url = f"{url}?sayfa={i}"
-            else:
-                current_url = url
+            function = lambda i=i: self.get_product(f"{url}?sayfa={i}", subcategory_id, brand_id)
+            
+            run.append(function)
+            print(function, f"{url}?sayfa={i}")
 
-            print(current_url)
-            if len(threads) == MAX_THREADS:
-                for t in threads:
-                    t.join()
-                threads = []
-
-            thread = threading.Thread(
-                target = self.get_product, 
-                args=(current_url, subcategory_id, brand_id)
-            )
-            thread.start()
-            threads.append(thread)
-        
-        # Wait for the remaining threads
-        for t in threads:
-            t.join()
+        print(run)
+        self.asession.run(*run)
         
         with sqlite3.connect(self.database) as conn:
             c = conn.cursor()
 
             for query in self.queries:
+                print(query)
                 c.execute(*query)
-                
+            
             self.queries = []
             conn.commit()
 
@@ -275,20 +217,9 @@ class Crawler(object):
 
             conn.commit()
 
-def main():
-    # TODO: Keep in the database url, initial price and current price. And when
-    # the program is triggered, check additional information in the url
-
-    url = "https://www.hepsiburada.com/fotograf-makinesi-aksesuarlari-c-60000190"
-
-    crawler = Crawler("./data/data.db")
-    crawler.delete_subcategory(21)
-    # crawler.create_subcategories()
-    
-    # start = time.time()
-    # crawler.get_products(url, 21)
-    # print(time.time() - start)
-
-
 if __name__ == "__main__":
-    main()
+    # The soultion to all my problems 
+    # https://stackoverflow.com/questions/452610/how-do-i-create-a-list-of-python-lambdas-in-a-list-comprehension-for-loop
+
+    scraper = Scraper("./data/data.db")
+    scraper.get_products("https://www.hepsiburada.com/iphone-ios-telefonlar-c-60005202", 6)

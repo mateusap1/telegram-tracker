@@ -1,6 +1,6 @@
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-from scraper import Scraper
+from scraping import Scraper
 
 import json
 
