@@ -1,16 +1,16 @@
 from fake_useragent import UserAgent
 from time import sleep
 from urllib.parse import urlparse
-from requests_html import HTMLSession
+from requests_html import AsyncHTMLSession
 
 import random
 import sqlite3
+import requests
 from requests import Response
 import re
 import csv
-import threading
-import threading
 import ast
+import time
 
 proxy_list = []
 with open("./input/proxylist.csv", "r") as f:
@@ -20,17 +20,16 @@ with open("./input/proxylist.csv", "r") as f:
 
 ua = UserAgent()
 MAIN_URL = "https://www.hepsiburada.com/"
+MAX_THREADS = 10
 
 
 class Crawler(object):
 
     def __init__(self, database: str):
-        self.session = HTMLSession()
+        self.session = AsyncHTMLSession
         self.database = database
 
-        self.categories = []
-        self.subcategories = []
-        self.products = []
+        self.queries = []
 
         self.use_proxy = False
     
@@ -55,14 +54,14 @@ class Crawler(object):
                 print("Error")
                 pass
 
-    def crawl(self, url: str) -> Response:
+    async def crawl(self, url: str) -> Response:
         if self.use_proxy is True:
             self.session.headers = {"User-Agent", ua.random}
             self.set_proxy()
 
             while True:
                 try:
-                    response = self.session.get(url, timeout=3)
+                    response = await self.session.get(url, timeout=3)
                     break
                 except requests.exceptions.RequestException as e:
                     print(e)
@@ -83,8 +82,8 @@ class Crawler(object):
             print(response.status_code)
             return None
         
-    def get_categories(self) -> dict:
-        response = self.crawl(MAIN_URL)
+    async def get_categories(self) -> dict:
+        response = await self.crawl(MAIN_URL)
 
         section_elements = response.html.find("section")
 
@@ -111,45 +110,47 @@ class Crawler(object):
         
         return categories
     
-    def create_subcategory(self, name: str, url: str, index: int) -> None:
-        self.categories.append((name, url))
+    async def create_subcategory(self, name: str, url: str, index: int) -> None:
+        self.queries.append(("INSERT INTO categories VALUES (?, ?)", (name, url)))
 
-        response = self.crawl(url)
+        response = await self.crawl(url)
 
         a_elements = response.html.xpath("//div[@class='categories']/div/div/ul[@class='items']/li/a")
         for a_el in a_elements:
             sub_name = a_el.text
             sub_url = MAIN_URL[:-1] + a_el.attrs["href"]
 
-            self.subcategories.append((sub_name, sub_url, index))
+            self.queries.append(("INSERT INTO subcategories VALUES (?, ?, ?)", (sub_name, sub_url, index)))
 
     def create_subcategories(self):
-        number_of_threads = 0
+        threads = []
         index = 1
         for name, url in self.get_categories().items():
-            number_of_threads = 0
-            while number_of_threads > 10:
-                number_of_threads = threading.active_count()
+            if len(threads) == MAX_THREADS:
+                for t in threads:
+                    t.join()
+                threads = []
 
             thread = threading.Thread(
                 target = self.create_subcategory, 
                 args=(name, url, index)
             )
             thread.start()
-            
+            threads.append(thread)
+
             index += 1
+        
+        # Wait for the remaining threads
+        for t in threads:
+            t.join()
         
         with sqlite3.connect(self.database) as conn:
             c = conn.cursor()
 
-            for values in self.categories:
-                print("Categories")
-                c.execute("INSERT INTO categories VALUES (?, ?)", values)
+            for query in self.queries:
+                c.execute(*query)
             
-            for values in self.subcategories:
-                print("Subcategories")
-                c.execute("INSERT INTO subcategories VALUES (?, ?, ?)", values)
-            
+            self.queries = []
             conn.commit()
 
     def get_product(self, url: str, subcategory_id: int, brand_id: int=None) -> None:
@@ -207,53 +208,86 @@ class Crawler(object):
                 last_product = c.fetchone()
         
                 if last_product is None:
-                    self.products.append((
-                        p_id,
-                        p_price,
-                        p_price,
-                        p_name,
-                        p_merchant,
-                        p_url,
-                        subcategory_id,
-                        brand_id
-                    ))
+                    self.queries.append((
+                        "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (
+                            p_id,
+                            p_price,
+                            p_price,
+                            p_name,
+                            p_merchant,
+                            p_url,
+                            subcategory_id,
+                            brand_id
+                    )))
                 else:
-                    self.products.append((p_price, p_id))
+                    self.queries.append((
+                        "UPDATE products SET current_price = ? WHERE product_id = ?", 
+                        (p_price, p_id)
+                    ))
 
     def get_products(self, url: str, subcategory_id: int, brand_id: int=None, limit: int=10) -> None:
-        for i in range(1, limit+1):
-            current_url = f"{url}?sayfa={i}"
+        # Getting the response from the url
+        response = self.crawl(url)
 
-            number_of_threads = 0
-            while number_of_threads > 10:
-                number_of_threads = threading.active_count()
+        xpath = "//div[@id='pagination']/ul/li/a"
+        a_elements = response.html.xpath(xpath)
+
+        max_pages = int(a_elements[-1].attrs["class"][0].lstrip("page-"))
+
+        threads = []
+        for i in range(1, max_pages+1):
+            if i > 1:
+                current_url = f"{url}?sayfa={i}"
+            else:
+                current_url = url
+
+            print(current_url)
+            if len(threads) == MAX_THREADS:
+                for t in threads:
+                    t.join()
+                threads = []
 
             thread = threading.Thread(
                 target = self.get_product, 
                 args=(current_url, subcategory_id, brand_id)
             )
             thread.start()
+            threads.append(thread)
+        
+        # Wait for the remaining threads
+        for t in threads:
+            t.join()
         
         with sqlite3.connect(self.database) as conn:
             c = conn.cursor()
 
-            for values in self.products:
-                print("Products")
-                if len(values) == 2:
-                    c.execute("UPDATE products SET current_price = ? WHERE product_id = ?", values)
-                else:
-                    c.execute("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?, ?)", values)
+            for query in self.queries:
+                c.execute(*query)
                 
+            self.queries = []
             conn.commit()
 
+    def delete_subcategory(self, subcategory_id: int) -> None:
+        with sqlite3.connect(self.database) as conn:
+            c = conn.cursor()
+
+            c.execute("DELETE FROM products WHERE subcategory_id = ?", (subcategory_id,))
+
+            conn.commit()
 
 def main():
-    # TODO: Add a queue of sql queries that will then be executed when threads end
-    url = "https://www.hepsiburada.com/iphone-ios-telefonlar-c-60005202"
+    # TODO: Keep in the database url, initial price and current price. And when
+    # the program is triggered, check additional information in the url
+
+    url = "https://www.hepsiburada.com/fotograf-makinesi-aksesuarlari-c-60000190"
 
     crawler = Crawler("./data/data.db")
-    crawler.create_subcategories()
-    crawler.get_products(url, 21)
+    crawler.delete_subcategory(21)
+    # crawler.create_subcategories()
+    
+    # start = time.time()
+    # crawler.get_products(url, 21)
+    # print(time.time() - start)
 
 
 if __name__ == "__main__":
