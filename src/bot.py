@@ -2,7 +2,7 @@ from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 from scraping import Scraper
 
-import json
+import sqlite3
 
 
 MAIN_URL = 'https://www.hepsiburada.com/'
@@ -13,33 +13,16 @@ class Bot(object):
     def __init__(self):
         self.scraper = Scraper()
         self.possible_categories = self.scraper.get_categories()
-        self.categories = {}
-        self.initial_products = {}
-        self.products_with_discount = []
         self.percentage = 0
-
-        self.load_initial_products()
 
         self.job_running = None
         self.delay = 30
-    
-    def save_initial_products(self):
-        data = {
-            "categories": self.categories,
-            "initial_products": self.initial_products
-        }
-
-        with open('data.json', 'w') as json_file:
-            json.dump(data, json_file)
-    
-    def load_initial_products(self):
-        with open('data.json', 'r') as json_file:
-            json_read = json.load(json_file)
-            self.categories = dict(json_read["categories"])
-            self.initial_products = dict(json_read["initial_products"])
 
     def price_tracking(self, context: CallbackContext):
         job = context.job
+
+
+        self.scraper.get_products()
 
         current_products = {}
         categories = self.categories.items()
