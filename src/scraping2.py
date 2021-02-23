@@ -1,13 +1,12 @@
-from requests_html import HTMLSession, AsyncHTMLSession
-from requests import Response
-
 import random
 import sqlite3
-import requests
 import csv
 import ast
 import time
-import asyncio
+import grequests
+from requests_html import HTML
+
+from bs4 import BeautifulSoup
 
 
 proxy_list = []
@@ -18,17 +17,23 @@ with open("./input/proxylist.csv", "r") as f:
 
 
 MAIN_URL = "https://www.hepsiburada.com/"
-MAX_THREADS = 15
+MAX_REQUESTS = 25
 TIMEOUT = 3
 LIMIT = 10
+HEADERS = {
+    "Accept-Language": "en-US,en;q=0.5",
+    "Connection": "keep-alive",
+    "Referer": "https://www.hepsiburada.com/",
+    "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:85.0) Gecko/20100101 Firefox/85.0"
+}
 
 
 class Scraper(object):
 
     def __init__(self, database: str):
-        self.session = requests.session()
         self.database = database
 
+        self.requests = []
         self.queries = []
         self.products = []
         self.use_proxy = False
@@ -48,9 +53,9 @@ class Scraper(object):
         with sqlite3.connect(self.database) as conn:
             c = conn.cursor()
             for product in self.products:
-                product_id, product_price, product_url, subcategory_id = product
+                product_id, product_price, product_url, seller, subcategory_id = product
 
-                c.execute("SELECT * FROM product WHERE product_id = ?", (product_id, ))
+                c.execute("SELECT * FROM products WHERE product_id = ?", (product_id, ))
                 if len(c.fetchall()) > 0:
                     c.execute(
                         "UPDATE products SET current_price = ? WHERE product_id = ?", 
@@ -58,17 +63,29 @@ class Scraper(object):
                     )
                 else:
                     c.execute(
-                        "INSERT INTO products VALUES (?, ?, ?, ?, ?)", (
+                        "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?)", (
                             product_id, 
                             product_price,
                             product_price,
+                            seller,
                             product_url,
                             subcategory_id
                     ))
 
-    async def request(self, url):
-        r = await self.session.get(url)
+    def make_request(self, url):
+        rs = (grequests.get(url, headers=HEADERS), )
+        r = grequests.map(rs, size=1)
+
+        return r[0]
+
+    def make_requests(self):
+        r = grequests.map(self.requests, size=MAX_REQUESTS)
+        self.requests = []
+
         return r
+
+    def add_request(self, url):
+        self.requests.append(grequests.get(url, headers=HEADERS))
 
     def random_proxy(self) -> str:
         """Returns a random proxy."""
@@ -101,16 +118,17 @@ class Scraper(object):
         if self.use_proxy is True:
             self.set_proxy()
 
-        response = self.session.get(MAIN_URL)
+        response = self.make_request(MAIN_URL)
+        soup = BeautifulSoup(response.content, "html.parser")
 
-        section_elements = response.html.find("section")
+        section_elements = soup.find_all("section")
 
         if len(section_elements) == 0:
             return None
         
         categories = {}
         for section_element in section_elements:
-            h5_elements = section_element.find("h5")
+            h5_elements = section_element.find_all("h5")
             
             if len(h5_elements) == 0:
                 continue 
@@ -119,10 +137,10 @@ class Scraper(object):
                 # Finds the h5 element with text "Categories" and gets the URLs
                 category_section = section_element
 
-                ul_element = category_section.find("ul")[0]
-                li_elements = ul_element.find("li")
+                ul_element = category_section.find_all("ul")[0]
+                li_elements = ul_element.find_all("li")
                 for li_element in li_elements:
-                    a_elements = li_element.find("a")
+                    a_elements = li_element.find_all("a")
                     for a_element in a_elements:
                         if "href" in a_element.attrs and len(a_element.attrs["href"]) > 0:
                             categories[a_element.attrs["title"]] = a_element.attrs["href"]
@@ -142,9 +160,10 @@ class Scraper(object):
                 c = conn.cursor()
                 c.execute("INSERT INTO categories VALUES (?, ?)", (name, url))
 
-                response = self.session.get(url)
+                response = self.make_request(url)
+                html = HTML(html=response.content)
 
-                a_elements = response.html.xpath("//div[@class='categories']/div/div/ul[@class='items']/li/a")
+                a_elements = html.xpath("//div[@class='categories']/div/div/ul[@class='items']/li/a")
                 for a_el in a_elements:
                     sub_name = a_el.text
                     sub_url = MAIN_URL[:-1] + a_el.attrs["href"]
@@ -158,8 +177,7 @@ class Scraper(object):
     def get_products(self, subcategory_id: int, required_brands: list=[]) -> None:
         if self.use_proxy is True:
             self.set_proxy()
-        
-        print(subcategory_id)
+
         with sqlite3.connect(self.database) as conn:
             # Gets the subcategory based on the rowid
             c = conn.cursor()
@@ -173,15 +191,16 @@ class Scraper(object):
             subcategory_url = row[1]
             conn.commit()
 
-        response = self.session.get(subcategory_url, timeout=TIMEOUT)
-        seller_els = response.html.xpath("//li[@class='box-container satici']/ol/li")
+        response = self.make_request(subcategory_url)
+        html = HTML(html=response.content)
+        seller_els = html.xpath("//li[@class='box-container satici']/ol/li")
 
         sellers = []
         for el in seller_els:
             if "title" in el.attrs:
                 sellers.append(el.attrs["title"])
 
-        brand_els = response.html.xpath("//li[@class='box-container brand']/ol/li")
+        brand_els = html.xpath("//li[@class='box-container brand']/ol/li")
         brands = []
         for el in brand_els:
             if "title" in el.attrs:
@@ -192,43 +211,68 @@ class Scraper(object):
         # Is the URL with the selected brands added
         brand_url = MAIN_URL + "-".join(brands) + "/" + subcategory_url.split("/")[-1]
 
-        async def get_seller_products(seller):
-            seller_url = brand_url + "?filtreler=satici:" + seller
+        def get_seller_products(seller, a_els):
+            print(len(a_els))
 
-            response = await self.asession.get(seller_url, timeout=TIMEOUT)
+            for el in a_els:
+                if bool(el.attrs["data-isinstock"]) is True:
+                    product_id = el.attrs["data-productid"]
+                    product_price = float(el.attrs["data-price"])
+                    product_url = MAIN_URL + el.attrs["href"]
 
-            a_els = response.html.xpath("//div[@id='pagination']/ul/li/a")
-            max_pages = int(a_els[-1].attrs["class"][0].lstrip("page-"))
+                    for brand in brands:
+                        self.queries.append((
+                            "INSERT INTO brands VALUES (?, ?)",
+                            (brand, product_id)
+                        ))
 
-            print(max_pages)
-            for i in range(1, min(max_pages, LIMIT)+1):
-                current_url = f"{seller_url}&sayfa={i}"
-
-                response = self.asession.get(current_url, timeout=TIMEOUT)
-
-                a_els = response.html.xpath("//ul[@class='product-list']/li/div/a")
-                for el in a_els:
-                    if bool(el.attrs["data-isinstock"]) is True:
-                        product_id = el.attrs["data-productid"]
-                        product_price = float(el.attrs["data-price"])
-                        product_url = MAIN_URL + el.attrs["href"]
-
-                        for brand in brands:
-                            self.queries.append((
-                                "INSERT INTO brands VALUES (?, ?)",
-                                (brand, product_id)
-                            ))
-                        
-                        self.products.append((product_id, product_price, product_url, subcategory_id))
+                    self.products.append((product_id.lower(), product_price, product_url, seller, subcategory_id))
+                else:
+                    print("ERROR")
         
         if len(sellers) == 0:
             print("ERROR")
             return
 
-        loop = asyncio.get_event_loop()
-        tasks = [get_seller_products(seller) for seller in sellers]
-        loop.run_until_complete(asyncio.wait(tasks))
+        for seller in sellers:
+            seller_url = brand_url + "?filtreler=satici:" + seller
+            self.add_request(seller_url)
+        
+        responses = self.make_requests()
 
+        sellers_ext = []
+        for seller, response in zip(sellers, responses):
+            seller_url = brand_url + "?filtreler=satici:" + seller
+
+            html = HTML(html=response.content)
+
+            a_els = html.xpath("//div[@id='pagination']/ul/li/a")
+            if len(a_els) > 0:
+                max_pages = int(a_els[-1].attrs["class"][0].lstrip("page-"))
+            else:
+                max_pages = 1
+
+            print(max_pages)
+            for i in range(1, min(max_pages, LIMIT)+1):
+                current_url = f"{seller_url}&sayfa={i}"
+                self.add_request(current_url)
+                sellers_ext.append(seller)
+
+        responses = self.make_requests()
+
+        print(len(sellers_ext))
+        with sqlite3.connect(self.database) as conn:
+            a_els_group = []
+            for i, seller in enumerate(sellers_ext):
+                html = HTML(html=responses[i].content)
+                a_els_group.append(html.xpath("//div[@class='box product hb-placeholder']/a"))
+            
+            print("Done")
+            
+            for seller, a_els in zip(sellers_ext, a_els_group):
+                get_seller_products(seller, a_els)
+            
+        print("DATABASE")
         self.execute_queries()
         self.add_products()
 
