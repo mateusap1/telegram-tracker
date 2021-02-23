@@ -1,4 +1,4 @@
-from requests_html import AsyncHTMLSession, HTMLSession
+from requests_html import HTMLSession
 from requests import Response
 
 import random
@@ -7,6 +7,8 @@ import requests
 import csv
 import ast
 import time
+import threading
+
 
 proxy_list = []
 with open("./input/proxylist.csv", "r") as f:
@@ -18,19 +20,21 @@ with open("./input/proxylist.csv", "r") as f:
 MAIN_URL = "https://www.hepsiburada.com/"
 MAX_THREADS = 10
 TIMEOUT = 3
+LIMIT = 10
 
 
 class Scraper(object):
 
     def __init__(self, database: str):
         self.session = HTMLSession()
-        self.asession = AsyncHTMLSession()
         self.database = database
 
         self.queries = []
         self.use_proxy = False
     
     def execute_queries(self):
+        """Executes the queries added to the queue in order."""
+
         with sqlite3.connect(self.database) as conn:
             c = conn.cursor()
             for query in self.queries:
@@ -38,6 +42,8 @@ class Scraper(object):
             conn.commit()
     
     def random_proxy(self) -> str:
+        """Returns a random proxy."""
+
         return random.choice(proxy_list)
     
     def set_proxy(self, proxy_candidates: list=proxy_list, verify: bool=False) -> None:
@@ -45,6 +51,7 @@ class Scraper(object):
         Configure the session to use one of the proxy_candidates. If verify is
         True, then the proxy will have been verified to work.
         """
+
         while True:
             proxy = random.choice(proxy_candidates)
             self.session.proxies = {"https": proxy, "http": proxy}
@@ -60,6 +67,8 @@ class Scraper(object):
                 pass
 
     def get_categories(self) -> dict:
+        """Gets the possible categories in the main url"""
+
         if self.use_proxy is True:
             self.set_proxy()
 
@@ -91,6 +100,8 @@ class Scraper(object):
         return categories
 
     def create_subcategories(self) -> None:
+        """Finds subcategories based on each category URL."""
+
         if self.use_proxy is True:
             self.set_proxy()
 
@@ -114,8 +125,10 @@ class Scraper(object):
             index += 1
 
     def get_product_info(self, url: str, subcategory_id: int, brand_id: int=None, repeated_product: bool=False) -> None:
-        response = self.asession.get(url)
-        await response.html.arender()
+        """Gets all the product info based on its URL."""
+
+        response = self.session.get(url)
+        # response.html.render(timeout=TIMEOUT)
 
         els_seller_names = response.html.xpath("//a[@class='merchant-name small']")
         els_seller_prices = response.html.xpath("//span[@class='price product-price']")
@@ -132,31 +145,32 @@ class Scraper(object):
 
         product_id = url.split("-")[-1].lower()
         
-        if len(els_product_name) <= 0:
+        if len(els_product_name) == 0:
             return
 
-        product_name = els_product_name.text[0]
+        product_name = els_product_name[0].text
             
         for seller_name, seller_price in zip(seller_names, seller_prices):
+            price = float(els_current_price[0].text.rstrip("TL").replace(".", "").replace(",", "."))
             if repeated_product is False:
-                self.queries.append(
+                self.queries.append((
                     "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
                     product_id,
-                    seller_price,
-                    seller_price,
+                    price,
+                    price,
                     product_name,
                     seller_name,
                     variant_names,
                     url,
                     subcategory_id,
                     brand_id
-                ))
+                )))
             elif repeated_product is True:
-                self.queries.append(
+                self.queries.append((
                     "UPDATE products SET current_price = ? WHERE product_id = ?", (
-                    seller_price,
+                    price,
                     product_id
-                ))
+                )))
         
         if len(seller_names) == 0:
             if len(els_current_seller) > 0:
@@ -167,7 +181,7 @@ class Scraper(object):
         
         if current_price is not None and current_seller is not None:
             if repeated_product is False:
-                self.queries.append(
+                self.queries.append((
                     "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
                     product_id,
                     current_price,
@@ -178,44 +192,13 @@ class Scraper(object):
                     url,
                     subcategory_id,
                     brand_id
-                ))
+                )))
             elif repeated_product is True:
-                self.queries.append(
+                self.queries.append((
                     "UPDATE products SET current_price = ? WHERE product_id = ?", (
                     current_price,
                     product_id
-                ))
-
-    def get_product(self, url: str, subcategory_id: int, brand_id: int=None) -> None:
-        response = self.session.get(url)
-
-        xpath = "//div[@class='box-container loader']"
-        div_elements = response.html.xpath(xpath)
-
-        a_elements = []
-
-        for div in div_elements:
-            a_elements = div.find("a")
-            if len(a_elements) > 0:
-                break
-
-        urls = []
-        for element in a_elements:            
-            if not "href" in element.attrs:
-                continue
-
-            urls.append(MAIN_URL + element.attrs["href"][1:])
-        
-        if len(urls) > 0:
-            run = []
-            for current_url in urls:
-                f = lambda current_url=current_url: self.get_product_info(current_url, subcategory_id, brand_id)
-                
-                run.append(f)
-            
-            print(run)
-            self.asession.run(*run)
-
+                )))
 
     def get_products(self, url: str, subcategory_id: int, brand_id: int=None) -> None:
         if self.use_proxy is True:
@@ -229,8 +212,49 @@ class Scraper(object):
         max_pages = int(a_elements[-1].attrs["class"][0].lstrip("page-"))
         print(max_pages)
 
-        for i in range(1, max_pages+1):
-            self.get_product(f"{url}?sayfa={i}", subcategory_id, brand_id)
+        for i in range(1, min(max_pages, LIMIT)+1):
+            if i > 1:
+                current_url = f"{url}?sayfa={i}"
+            else:
+                current_url = url
+
+            response = self.session.get(current_url)
+            print(current_url)
+
+            xpath = "//div[@class='box-container loader']"
+            div_elements = response.html.xpath(xpath)
+
+            a_elements = []
+            for div in div_elements:
+                a_elements = div.find("a")
+                if len(a_elements) > 0:
+                    break
+
+            urls = []
+            for element in a_elements:            
+                if not "href" in element.attrs:
+                    continue
+
+                urls.append(MAIN_URL + element.attrs["href"][1:])
+            
+            if len(urls) > 0:
+                threads = []
+                for current_url in urls:
+                    if len(threads) == MAX_THREADS:
+                        for t in threads:
+                            t.join()
+                        threads = []
+
+                    thread = threading.Thread(
+                        target = self.get_product_info, 
+                        args=(current_url, subcategory_id, brand_id)
+                    )
+                    thread.start()
+                    threads.append(thread)
+        
+                # Wait for the remaining threads
+                for t in threads:
+                    t.join()
         
         self.execute_queries()
 
@@ -242,9 +266,19 @@ class Scraper(object):
 
             conn.commit()
 
-if __name__ == "__main__":
-    # The soultion to all my problems 
-    # https://stackoverflow.com/questions/452610/how-do-i-create-a-list-of-python-lambdas-in-a-list-comprehension-for-loop
+def main():
+    # TODO: Keep in the database url, initial price and current price. And when
+    # the program is triggered, check additional information in the url
+
+    url = "https://www.hepsiburada.com/fotograf-makinesi-aksesuarlari-c-60000190"
 
     scraper = Scraper("./data/data.db")
-    scraper.get_products("https://www.hepsiburada.com/iphone-ios-telefonlar-c-60005202", 6)
+    # scraper.create_subcategories()
+    
+    start = time.time()
+    scraper.get_products(url, 2)
+    print(time.time() - start)
+
+
+if __name__ == "__main__":
+    main()

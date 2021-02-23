@@ -9,6 +9,7 @@ c.execute("""CREATE TABLE products (
     current_price REAL,
     title TEXT,
     merchant TEXT,
+    variant TEXT,
     url TEXT,
     subcategory_id INTEGER,
     brand_id INTEGER
