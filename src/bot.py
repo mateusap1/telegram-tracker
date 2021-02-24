@@ -2,6 +2,7 @@ from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 from scraping import Scraper
 
+import telegram
 import sqlite3
 
 
@@ -13,13 +14,65 @@ class Bot(object):
 
     def __init__(self):
         self.scraper = Scraper(DATABASE)
-        self.possible_categories = self.scraper.get_categories()
-        self.percentage = 0
-
         self.job_running = None
+        self.percentage = 0
         self.delay = 30
     
-    def compare_prices(self, context: CallbackContext):
+    def get_subcategories_str(self) -> None:
+        with sqlite3.connect(DATABASE) as conn:
+            c = conn.cursor()
+
+            c.execute("SELECT rowid, * FROM categories;")
+            c_rows = c.fetchall()
+
+            possible_categories = []
+            for c_row in c_rows:
+                current_str = ""
+                c.execute("SELECT * FROM subcategories WHERE category_id = ?;", (c_row[0],))
+                subc_rows = c.fetchall()
+
+                if len(subc_rows) > 0:
+                    current_str += "[Category] - " + c_row[1] + "\n"
+
+                for subc_row in subc_rows:
+                    current_str += "[Subcategory]\t\t - " + subc_row[0] + "\n"
+                
+                if len(current_str) > 0:
+                    possible_categories.append(current_str)
+            
+            if len(possible_categories) == 0:
+                possible_categories = ["\t\tEmpty"]
+                
+        return possible_categories
+    
+    def my_subcategories_str(self) -> None:
+        with sqlite3.connect(DATABASE) as conn:
+            c = conn.cursor()
+
+            c.execute("SELECT rowid, * FROM categories;")
+            c_rows = c.fetchall()
+
+            possible_categories = []
+            for c_row in c_rows:
+                current_str = ""
+                c.execute("SELECT * FROM subcategories WHERE category_id = ? AND added = 1;", (c_row[0],))
+                subc_rows = c.fetchall()
+
+                if len(subc_rows) > 0:
+                    current_str += "[Category] - " + c_row[1] + "\n"
+
+                for subc_row in subc_rows:
+                    current_str += "[Subcategory]\t\t - " + subc_row[0] + "\n"
+                
+                if len(current_str) > 0:
+                    possible_categories.append(current_str)
+            
+            if len(possible_categories) == 0:
+                possible_categories = ["\t\tEmpty"]
+                
+        return possible_categories
+
+    def compare_prices(self, context: CallbackContext) -> None:
         """Check the database to see if any product is with a low price"""
 
         job = context.job
@@ -29,50 +82,43 @@ class Bot(object):
 
             c.execute("SELECT * FROM products")
             prod_rows = c.fetchall()
+
+            for row in prod_rows:
+                product_id, product_name, last_price, current_price, \
+                    merchant, url, subcategory_id = row
+                
+                if self.job_running is None:
+                    return
+                
+                price_difference = last_price - current_price
+                percentage = price_difference / last_price
+                percentage_str = str("%.2f" % (percentage * 100))
+
+                if percentage >= self.percentage:
+                    message = product_name + "\n\n" + \
+                        "Satıcı: " + merchant + "\n\n" + \
+                        str(last_price) + " TL >>>> " + \
+                        str(current_price) + f" TL - {percentage_str}%" + "\n\n" + \
+                        url + "\n\n" + \
+                        MAIN_URL + "ara?q=" + product_id
+
+                    context.bot.send_message(
+                        chat_id = job.context, 
+                        text = message
+                    )
+
+                    c.execute(
+                        "UPDATE products SET last_price = ? WHERE product_id = ?",
+                        (current_price, product_id)
+                    )
             
-            # TODO: Compare prices to see if its below the percentage.
-            # If so, collect the extra data needed on the website and
-            # send a message to the user.
+            conn.commit()
 
-        for product_id, current_product_data in current_products.items():
-            if self.job_running is None:
-                return
-
-            if not product_id in self.initial_products:
-                self.initial_products[product_id] = current_product_data
-                continue
-
-            initial_product_data = self.initial_products[product_id]
-            
-            initial_price = float(initial_product_data["price"])
-            current_price = float(current_product_data["price"])
-            
-            price_difference = initial_price - current_price
-            percentage = price_difference / initial_price
-            percentage_str = str("%.2f" % (percentage * 100))
-
-            if percentage >= self.percentage:
-                message = current_product_data["product_name"] + "\n\n" + \
-                          "Satıcı: " + current_product_data["merchant"] + "\n\n" + \
-                          initial_product_data["price"] + " TL >>>> " + \
-                          current_product_data["price"] + f" TL - {percentage_str}%" + "\n\n" + \
-                          current_product_data["url"] + "\n\n" + \
-                          MAIN_URL + "ara?q=" + product_id
-
-                context.bot.send_message(
-                    chat_id = job.context, 
-                    text = message
-                )
-
-                self.initial_products[product_id] = current_product_data
-
-    def price_tracking(self, context: CallbackContext):
-        job = context.job
-
+    def price_tracking(self, context: CallbackContext) -> None:
         with sqlite3.connect(DATABASE) as conn:
             c = conn.cursor()
 
-            c.execute("SELECT rowid, * FROM subcategoires WHERE added = ?", (1, ))
+            c.execute("SELECT rowid, * FROM subcategories WHERE added = ?", (1, ))
             subc_rows = c.fetchall()
             subc_ids = [row[0] for row in subc_rows]
 
@@ -83,7 +129,7 @@ class Bot(object):
         for subc_id in subc_ids:
             self.scraper.get_products(subc_id, brands)
         
-        self.compare_prices(context: CallbackContext)
+        self.compare_prices(context)
     
     def start_bot(self, update: Update, context: CallbackContext) -> None:
         """Message the user when the price is low"""
@@ -94,7 +140,7 @@ class Bot(object):
         if len(context.args) != 1:
             update.message.reply_text(
                 'Sorry, you need to pass the percentage as an argument.\n' +
-                'Example: /start 20%'
+                'e.g. /start 20%'
             )
             return
         
@@ -107,12 +153,10 @@ class Bot(object):
             return
 
         if percentage < 0 or percentage > 100:
-            update.message.reply_text('Sorry, the percentage must be between 0 and 100%')
+            update.message.reply_text('Sorry, the percentage must be between 0 and 100 percent')
             return
         
-        percentage = percentage / 100
-        
-        self.percentage = percentage
+        self.percentage = percentage / 100
         
         update.message.reply_text('Starting price tracker...')
         self.job_running = self.job.run_repeating(
@@ -130,83 +174,134 @@ class Bot(object):
             self.job_running.schedule_removal()
             self.job_running = None
             update.message.reply_text('Stoping bot...')
-        
-    def add_category(self, update: Update, context: CallbackContext) -> None:
-        """Adds a category to the list"""
 
-        # TODO: Make it asynchronously
-        if len(context.args) < 1:
-            update.message.reply_text(
-                "Sorry, you must pass the category as an argument\n" + 
-                "Example: /addcategory Elektronik"
-            )
-            return
+    def add_subcategory(self, update: Update, context: CallbackContext) -> None:
+        """Adds a subcategory to the list"""
 
-        category = " ".join(context.args)
-        if not category in self.possible_categories:
-            update.message.reply_text(
-                "Sorry, category not found\n" + 
-                "Possible categories:\n" +
-                "\n".join([category for category, url in self.possible_categories.items()])
-            )
-            return
-        
-        self.categories[category] = self.possible_categories[category]
-        self.save_initial_products()
+        with sqlite3.connect(DATABASE) as conn:
+            c = conn.cursor()
 
-        update.message.reply_text("Category added successfuly")
+            if len(context.args) < 1:
+                update.message.reply_text(
+                    "Sorry, you must pass the subcategory as an argument\n" + 
+                    "e.g. /addsubcategory <subcategory>"
+                )
+                return
 
-    def remove_category(self, update: Update, context: CallbackContext) -> None:
-        """Removes a category from the list"""
+            subcategory = " ".join(context.args)
 
-        if len(context.args) < 1:
-            update.message.reply_text(
-                "Sorry, you must pass the category as an argument\n" + 
-                "Example: /removecategory Elektronik"
-            )
-            return
+            c.execute("SELECT rowid, * FROM subcategories WHERE name = ?;", (subcategory,))
+            row = c.fetchone()
 
-        category = " ".join(context.args)
+            if row is None:
+                update.message.reply_text(
+                    "Sorry, this subcategory wasn't in the list\n" + 
+                    "Possible subcategories:\n"
+                )
 
-        if not category in self.categories:
-            update.message.reply_text(
-                "Sorry, this category wasn't in the list\n" + 
-                "Your categories:\n" +
-                "\n".join([category for category, url in self.categories.items()])
-            )
-            return
-        
-        new_categories = {}
+                categories = self.get_subcategories_str()
+                for category in categories:
+                    update.message.reply_text(category)
+                    
+                return
 
-        for cat, url in self.categories.items():
-            if cat != category:
-                new_categories[cat] = url
+            c.execute("UPDATE subcategories SET added = 1 WHERE name = ?;", (subcategory, ))
+            conn.commit()
 
-        self.categories = new_categories # remove category
+            update.message.reply_text("Subcategory added successfuly")
+    
+    def remove_subcategory(self, update: Update, context: CallbackContext) -> None:
+        """Removes a subcategory from the list"""
 
-        category_products = self.scraper.get_products(self.possible_categories[category])
+        with sqlite3.connect(DATABASE) as conn:
+            c = conn.cursor()
 
-        self.initial_products =  [product for product in self.initial_products \
-                                  if not product in category_products]
-        self.save_initial_products()
-        
-        update.message.reply_text(f"The category \"{category}\" was successfuly removed")
+            if len(context.args) < 1:
+                update.message.reply_text(
+                    "Sorry, you must pass the subcategory as an argument\n" + 
+                    "e.g. /removesubcategory <subcategory>"
+                )
+                return
+
+            subcategory = " ".join(context.args)
+
+            c.execute("SELECT rowid, * FROM subcategories WHERE name = ?;", (subcategory,))
+            row = c.fetchone()
+
+            if row is None:
+                update.message.reply_text(
+                    "Sorry, this subcategory wasn't in the list\n" + 
+                    "Your subcategories:\n"
+                )
+
+                categories = self.my_subcategories_str()
+                for category in categories:
+                    update.message.reply_text(category)
+                return
+
+            c.execute("UPDATE subcategories SET added = 0 WHERE name = ?;", (subcategory, ))
+            conn.commit()
+            
+        self.scraper.delete_subcategory(row[0])
+        update.message.reply_text(f"The subcategory \"{subcategory}\" was successfuly removed")
+
+    def add_brand(self, update: Update, context: CallbackContext) -> None:
+        """Add brand to the db"""
+
+        with sqlite3.connect(DATABASE) as conn:
+            c = conn.cursor()
+
+            if len(context.args) < 1:
+                update.message.reply_text(
+                    "Sorry, you must pass the brand name as an argument\n" + 
+                    "e.g. /addbrand <brand>"
+                )
+                return
+
+            brand = " ".join(context.args)
+
+            c.execute("INSERT INTO brands VALUES (?)", (brand, ))
+            conn.commit()
+
+            update.message.reply_text(f"Brand successfuly added")
+    
+    def remove_brand(self, update: Update, context: CallbackContext) -> None:
+        """Remove brand from the db"""
+
+        with sqlite3.connect(DATABASE) as conn:
+            c = conn.cursor()
+
+            if len(context.args) < 1:
+                update.message.reply_text(
+                    "Sorry, you must pass the brand name as an argument\n" + 
+                    "e.g. /removebrand <brand>"
+                )
+                return
+
+            brand = " ".join(context.args)
+
+            c.execute("DELETE FROM brands WHERE name = ?;", (brand, ))
+            conn.commit()
+
+            update.message.reply_text(f"The brand \"{brand}\" was successfuly removed")
     
     def get_status(self, update: Update, context: CallbackContext) -> None:
         if self.job_running is None:
-            update.message.reply_text(
-                "Tracker Status: Stopped\n" +
-                f"Current Percentage: {self.percentage * 100}%\n" +
-                "Categories: " + 
-                (", ".join(self.categories.keys()) if self.categories.keys() else "Empty")
-            )
+            status = "Stopped"
         else:
-            update.message.reply_text(
-                "Tracker Status: Running\n" +
-                f"Current Percentage: {self.percentage * 100}%\n" +
-                "Categories: " + 
-                (", ".join(self.categories.keys()) if self.categories.keys() else "Empty")
-            )
+            status = "Running"
+
+        percentage = str(self.percentage * 100) + "%"
+        
+        update.message.reply_text(
+            f"Tracker Status: {status}\n" +
+            f"Current Percentage: {percentage}\n" +
+            "Subcategories:\n"
+        )
+
+        categories = self.my_subcategories_str()
+        for category in categories:
+            update.message.reply_text(category)
         
     def change_percentage(self, update: Update, context: CallbackContext) -> None:
         if self.job_running is None:
@@ -216,7 +311,7 @@ class Bot(object):
         if len(context.args) != 1:
             update.message.reply_text(
                 "Sorry, you must pass the percentage as an argument\n" + 
-                "Example: /changepercentage 30%"
+                "e.g. /changepercentage 30%"
             )
             return
 
@@ -247,8 +342,10 @@ class Bot(object):
             "/start <percentage>: messages the user when the price is lower than " +
             "the original price by a given percentage\n" +
             "/stop: stops tracking price loop\n" +
-            "/addcategory <category>: adds a category to the list\n" +
-            "/removecategory <category>: removes a category from the list\n" +
+            "/addsubcategory <subcategory>: adds a subcategory to the list\n" +
+            "/removesubcategory <subcategory>: removes a subcategory from the list\n" +
+            "/addbrand <brand>: adds a brand to the list\n" +
+            "/removebrand <brand>: removes a brand from the list\n" +
             "/changepercentage <new percentage>: changes the percentage to a new value\n" +
             "/status: messages the product status"
         )
@@ -264,8 +361,11 @@ class Bot(object):
         dispatcher.add_handler(CommandHandler("start", self.start_bot))
         dispatcher.add_handler(CommandHandler("stop", self.stop_bot))
 
-        dispatcher.add_handler(CommandHandler("addcategory", self.add_category))
-        dispatcher.add_handler(CommandHandler("removecategory", self.remove_category))
+        dispatcher.add_handler(CommandHandler("addsubcategory", self.add_subcategory))
+        dispatcher.add_handler(CommandHandler("removesubcategory", self.remove_subcategory))
+
+        dispatcher.add_handler(CommandHandler("addbrand", self.add_brand))
+        dispatcher.add_handler(CommandHandler("removebrand", self.remove_brand))
 
         dispatcher.add_handler(CommandHandler("changepercentage", self.change_percentage))
 

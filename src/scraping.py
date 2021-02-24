@@ -4,8 +4,8 @@ import csv
 import ast
 import time
 import grequests
-from requests_html import HTML
 
+from requests_html import HTML
 from bs4 import BeautifulSoup
 
 
@@ -36,7 +36,7 @@ class Scraper(object):
         self.requests = []
         self.queries = []
         self.products = []
-        self.use_proxy = False
+        self.use_proxy = True
     
     def execute_queries(self):
         """Executes the queries added to the queue in order."""
@@ -55,11 +55,11 @@ class Scraper(object):
             for product in self.products:
                 product_id, product_name, product_price, product_url, seller, subcategory_id = product
 
-                c.execute("SELECT * FROM products WHERE product_id = ?", (product_id, ))
+                c.execute("SELECT * FROM products WHERE product_id = ? AND merchant = ?", (product_id, seller))
                 if len(c.fetchall()) > 0:
                     c.execute(
-                        "UPDATE products SET current_price = ? WHERE product_id = ?", 
-                        (product_price, product_id)
+                        "UPDATE products SET current_price = ? WHERE product_id = ? AND merchant = ?", 
+                        (product_price, product_id, seller)
                     )
                 else:
                     c.execute(
@@ -72,9 +72,21 @@ class Scraper(object):
                             product_url,
                             subcategory_id
                     ))
+            
+            conn.commit()
 
     def make_request(self, url):
-        rs = (grequests.get(url, headers=HEADERS), )
+        if self.use_proxy is True:
+            proxy = self.random_proxy()
+            proxies = {
+                "http": "http://" + proxy,
+                "https": "https://" + proxy, 
+            }
+
+            rs = (grequests.get(url, headers=HEADERS, proxies=proxies), )
+        else:
+            rs = (grequests.get(url, headers=HEADERS), )
+
         r = grequests.map(rs, size=1)
 
         return r[0]
@@ -86,38 +98,24 @@ class Scraper(object):
         return r
 
     def add_request(self, url):
-        self.requests.append(grequests.get(url, headers=HEADERS))
+        if self.use_proxy is True:
+            proxy = self.random_proxy()
+            proxies = {
+                "http": "http://" + proxy,
+                "https": "https://" + proxy, 
+            }
+
+            self.requests.append(grequests.get(url, headers=HEADERS, proxies=proxies))
+        else:
+            self.requests.append(grequests.get(url, headers=HEADERS))
 
     def random_proxy(self) -> str:
         """Returns a random proxy."""
 
         return random.choice(proxy_list)
-    
-    def set_proxy(self, proxy_candidates: list=proxy_list, verify: bool=False) -> dict:
-        """
-        Configure the session to use one of the proxy_candidates. If verify is
-        True, then the proxy will have been verified to work.
-        """
-
-        while True:
-            proxy = random.choice(proxy_candidates)
-            self.session.proxies = {"https": proxy, "http": proxy}
-            self.asession.proxies = {"https": proxy, "http": proxy}
-
-            if not verify:
-                return
-            try:
-                print(self.session.get('https://httpbin.org/ip', timeout=3).json())
-                return
-            except Exception:
-                print("Error")
-                pass
 
     def get_categories(self) -> dict:
         """Gets the possible categories in the main url"""
-
-        if self.use_proxy is True:
-            self.set_proxy()
 
         response = self.make_request(MAIN_URL)
         soup = BeautifulSoup(response.content, "html.parser")
@@ -152,9 +150,6 @@ class Scraper(object):
     def create_subcategories(self) -> None:
         """Finds subcategories based on each category URL."""
 
-        if self.use_proxy is True:
-            self.set_proxy()
-
         index = 1
         for name, url in self.get_categories().items():
             with sqlite3.connect(self.database) as conn:
@@ -176,8 +171,7 @@ class Scraper(object):
             index += 1
 
     def get_products(self, subcategory_id: int, required_brands: list=[]) -> None:
-        if self.use_proxy is True:
-            self.set_proxy()
+        """Add products from a subcategory to the db"""
 
         with sqlite3.connect(self.database) as conn:
             # Gets the subcategory based on the rowid
@@ -213,8 +207,6 @@ class Scraper(object):
         brand_url = MAIN_URL + "-".join(brands) + "/" + subcategory_url.split("/")[-1]
 
         def get_seller_products(seller, p_names, a_els):
-            print(len(a_els))
-
             for a_el, p_name in zip(a_els, p_names):
                 if bool(a_el.attrs["data-isinstock"]) is True:
                     product_id = a_el.attrs["data-productid"]
@@ -256,7 +248,6 @@ class Scraper(object):
             else:
                 max_pages = 1
 
-            print(max_pages)
             for i in range(1, min(max_pages, LIMIT)+1):
                 current_url = f"{seller_url}&sayfa={i}"
                 self.add_request(current_url)
@@ -270,15 +261,12 @@ class Scraper(object):
             for i, seller in enumerate(sellers_ext):
                 html = HTML(html=responses[i].content)
 
-                p_names.append(html.xpath("//noscript/img[@class='product-title']"))
+                p_names.append(html.xpath("//h3[@class='product-title title']"))
                 a_els_group.append(html.xpath("//div[@class='box product hb-placeholder']/a"))
-            
-            print("Done")
             
             for seller, p_name, a_els in zip(sellers_ext, p_names, a_els_group):
                 get_seller_products(seller, p_name, a_els)
             
-        print("DATABASE")
         self.execute_queries()
         self.add_products()
 
@@ -286,22 +274,6 @@ class Scraper(object):
         with sqlite3.connect(self.database) as conn:
             c = conn.cursor()
 
-            c.execute("DELETE FROM products WHERE subcategory_id = ?", (subcategory_id,))
+            c.execute("DELETE FROM products WHERE subcategory_id = ?;", (subcategory_id,))
 
             conn.commit()
-
-def main():
-    # TODO: Add product_name decently
-
-    url = "https://www.hepsiburada.com/fotograf-makinesi-aksesuarlari-c-60000190"
-
-    scraper = Scraper("./data/data.db")
-    scraper.create_subcategories()
-    
-    start = time.time()
-    scraper.get_products(2, ["HP"])
-    print(time.time() - start)
-
-
-if __name__ == "__main__":
-    main()
