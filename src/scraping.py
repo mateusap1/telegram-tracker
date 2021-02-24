@@ -9,13 +9,6 @@ from requests_html import HTML
 from bs4 import BeautifulSoup
 
 
-proxy_list = []
-with open("./input/proxylist.csv", "r") as f:
-    reader = csv.reader(f)
-    for row in reader:
-        proxy_list.append(row[0])
-
-
 MAIN_URL = "https://www.hepsiburada.com/"
 MAX_REQUESTS = 25
 TIMEOUT = 3
@@ -36,7 +29,6 @@ class Scraper(object):
         self.requests = []
         self.queries = []
         self.products = []
-        self.use_proxy = True
     
     def execute_queries(self):
         """Executes the queries added to the queue in order."""
@@ -76,16 +68,7 @@ class Scraper(object):
             conn.commit()
 
     def make_request(self, url):
-        if self.use_proxy is True:
-            proxy = self.random_proxy()
-            proxies = {
-                "http": "http://" + proxy,
-                "https": "https://" + proxy, 
-            }
-
-            rs = (grequests.get(url, headers=HEADERS, proxies=proxies), )
-        else:
-            rs = (grequests.get(url, headers=HEADERS), )
+        rs = (grequests.get(url, headers=HEADERS), )
 
         r = grequests.map(rs, size=1)
 
@@ -98,21 +81,7 @@ class Scraper(object):
         return r
 
     def add_request(self, url):
-        if self.use_proxy is True:
-            proxy = self.random_proxy()
-            proxies = {
-                "http": "http://" + proxy,
-                "https": "https://" + proxy, 
-            }
-
-            self.requests.append(grequests.get(url, headers=HEADERS, proxies=proxies))
-        else:
-            self.requests.append(grequests.get(url, headers=HEADERS))
-
-    def random_proxy(self) -> str:
-        """Returns a random proxy."""
-
-        return random.choice(proxy_list)
+        self.requests.append(grequests.get(url, headers=HEADERS))
 
     def get_categories(self) -> dict:
         """Gets the possible categories in the main url"""
