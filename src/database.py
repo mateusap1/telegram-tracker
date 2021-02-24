@@ -5,6 +5,7 @@ c = conn.cursor()
 
 c.execute("""CREATE TABLE products (
     product_id TEXT,
+    product_name TEXT,
     last_price REAL,
     current_price REAL,
     merchant TEXT,
@@ -20,12 +21,12 @@ c.execute("""CREATE TABLE categories (
 c.execute("""CREATE TABLE subcategories (
     name TEXT,
     url TEXT,
-    category_id INTEGER
+    category_id INTEGER,
+    added INTEGER
 )""")
 
 c.execute("""CREATE TABLE brands (
-    name TEXT,
-    url TEXT
+    name TEXT
 )""")
 
 conn.commit()

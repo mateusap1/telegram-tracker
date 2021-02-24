@@ -6,31 +6,34 @@ import sqlite3
 
 
 MAIN_URL = 'https://www.hepsiburada.com/'
+DATABASE = "./data/data.db"
 
 
 class Bot(object):
 
     def __init__(self):
-        self.scraper = Scraper()
+        self.scraper = Scraper(DATABASE)
         self.possible_categories = self.scraper.get_categories()
         self.percentage = 0
 
         self.job_running = None
         self.delay = 30
+    
+    def compare_prices(self, context: CallbackContext):
+        """Check the database to see if any product is with a low price"""
 
-    def price_tracking(self, context: CallbackContext):
         job = context.job
 
+        with sqlite3.connect(DATABASE) as conn:
+            c = conn.cursor()
 
-        self.scraper.get_products()
+            c.execute("SELECT * FROM products")
+            prod_rows = c.fetchall()
+            
+            # TODO: Compare prices to see if its below the percentage.
+            # If so, collect the extra data needed on the website and
+            # send a message to the user.
 
-        current_products = {}
-        categories = self.categories.items()
-        for category, url in categories:
-            category_products = self.scraper.get_products(url)
-            for product_id, product_data in category_products.items():
-                current_products[product_id] = product_data
-        
         for product_id, current_product_data in current_products.items():
             if self.job_running is None:
                 return
@@ -63,7 +66,24 @@ class Bot(object):
 
                 self.initial_products[product_id] = current_product_data
 
-        self.save_initial_products()
+    def price_tracking(self, context: CallbackContext):
+        job = context.job
+
+        with sqlite3.connect(DATABASE) as conn:
+            c = conn.cursor()
+
+            c.execute("SELECT rowid, * FROM subcategoires WHERE added = ?", (1, ))
+            subc_rows = c.fetchall()
+            subc_ids = [row[0] for row in subc_rows]
+
+            c.execute("SELECT * FROM brands")
+            brand_rows = c.fetchall()
+            brands = [row[0] for row in brand_rows]
+
+        for subc_id in subc_ids:
+            self.scraper.get_products(subc_id, brands)
+        
+        self.compare_prices(context: CallbackContext)
     
     def start_bot(self, update: Update, context: CallbackContext) -> None:
         """Message the user when the price is low"""

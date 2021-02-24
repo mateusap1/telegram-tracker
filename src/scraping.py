@@ -53,7 +53,7 @@ class Scraper(object):
         with sqlite3.connect(self.database) as conn:
             c = conn.cursor()
             for product in self.products:
-                product_id, product_price, product_url, seller, subcategory_id = product
+                product_id, product_name, product_price, product_url, seller, subcategory_id = product
 
                 c.execute("SELECT * FROM products WHERE product_id = ?", (product_id, ))
                 if len(c.fetchall()) > 0:
@@ -63,8 +63,9 @@ class Scraper(object):
                     )
                 else:
                     c.execute(
-                        "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?)", (
+                        "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", (
                             product_id, 
+                            product_name,
                             product_price,
                             product_price,
                             seller,
@@ -168,7 +169,7 @@ class Scraper(object):
                     sub_name = a_el.text
                     sub_url = MAIN_URL[:-1] + a_el.attrs["href"]
 
-                    c.execute("INSERT INTO subcategories VALUES (?, ?, ?)", (sub_name, sub_url, index))
+                    c.execute("INSERT INTO subcategories VALUES (?, ?, ?, ?)", (sub_name, sub_url, index, 0))
                 
                 conn.commit()
 
@@ -211,22 +212,25 @@ class Scraper(object):
         # Is the URL with the selected brands added
         brand_url = MAIN_URL + "-".join(brands) + "/" + subcategory_url.split("/")[-1]
 
-        def get_seller_products(seller, a_els):
+        def get_seller_products(seller, p_names, a_els):
             print(len(a_els))
 
-            for el in a_els:
-                if bool(el.attrs["data-isinstock"]) is True:
-                    product_id = el.attrs["data-productid"]
-                    product_price = float(el.attrs["data-price"])
-                    product_url = MAIN_URL + el.attrs["href"]
+            for a_el, p_name in zip(a_els, p_names):
+                if bool(a_el.attrs["data-isinstock"]) is True:
+                    product_id = a_el.attrs["data-productid"]
+                    product_name = p_name.attrs["title"]
+                    product_price = float(a_el.attrs["data-price"])
+                    product_url = MAIN_URL + a_el.attrs["href"]
 
-                    for brand in brands:
-                        self.queries.append((
-                            "INSERT INTO brands VALUES (?, ?)",
-                            (brand, product_id)
-                        ))
-
-                    self.products.append((product_id.lower(), product_price, product_url, seller, subcategory_id))
+                    # TODO: Maybe the problem was commiting to the db every time
+                    self.products.append((
+                        product_id.lower(), 
+                        product_name, 
+                        product_price, 
+                        product_url, 
+                        seller, 
+                        subcategory_id
+                    ))
                 else:
                     print("ERROR")
         
@@ -260,17 +264,19 @@ class Scraper(object):
 
         responses = self.make_requests()
 
-        print(len(sellers_ext))
         with sqlite3.connect(self.database) as conn:
             a_els_group = []
+            p_names = []
             for i, seller in enumerate(sellers_ext):
                 html = HTML(html=responses[i].content)
+
+                p_names.append(html.xpath("//noscript/img[@class='product-title']"))
                 a_els_group.append(html.xpath("//div[@class='box product hb-placeholder']/a"))
             
             print("Done")
             
-            for seller, a_els in zip(sellers_ext, a_els_group):
-                get_seller_products(seller, a_els)
+            for seller, p_name, a_els in zip(sellers_ext, p_names, a_els_group):
+                get_seller_products(seller, p_name, a_els)
             
         print("DATABASE")
         self.execute_queries()
@@ -285,13 +291,12 @@ class Scraper(object):
             conn.commit()
 
 def main():
-    # TODO: Keep in the database url, initial price and current price. And when
-    # the program is triggered, check additional information in the url
+    # TODO: Add product_name decently
 
     url = "https://www.hepsiburada.com/fotograf-makinesi-aksesuarlari-c-60000190"
 
     scraper = Scraper("./data/data.db")
-    # scraper.create_subcategories()
+    scraper.create_subcategories()
     
     start = time.time()
     scraper.get_products(2, ["HP"])
