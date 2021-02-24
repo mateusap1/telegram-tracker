@@ -30,7 +30,7 @@ class Scraper(object):
         self.queries = []
         self.products = []
     
-    def execute_queries(self):
+    def execute_queries(self) -> None:
         """Executes the queries added to the queue in order."""
 
         with sqlite3.connect(self.database) as conn:
@@ -39,7 +39,7 @@ class Scraper(object):
                 c.execute(*query)
             conn.commit()
     
-    def add_products(self):
+    def add_products(self) -> None:
         """Adds product if it is not already in the table"""
 
         with sqlite3.connect(self.database) as conn:
@@ -67,7 +67,7 @@ class Scraper(object):
             
             conn.commit()
 
-    def make_request(self, url):
+    def make_request(self, url: str):
         rs = (grequests.get(url, headers=HEADERS), )
 
         r = grequests.map(rs, size=1)
@@ -80,7 +80,7 @@ class Scraper(object):
 
         return r
 
-    def add_request(self, url):
+    def add_request(self, url: str) -> None:
         self.requests.append(grequests.get(url, headers=HEADERS))
 
     def get_categories(self) -> dict:
@@ -141,6 +141,8 @@ class Scraper(object):
 
     def get_products(self, subcategory_id: int, required_brands: list=[]) -> None:
         """Add products from a subcategory to the db"""
+
+        print(subcategory_id)
 
         with sqlite3.connect(self.database) as conn:
             # Gets the subcategory based on the rowid

@@ -126,6 +126,7 @@ class Bot(object):
             brand_rows = c.fetchall()
             brands = [row[0] for row in brand_rows]
 
+        print(subc_ids)
         for subc_id in subc_ids:
             self.scraper.get_products(subc_id, brands)
         
@@ -241,7 +242,7 @@ class Bot(object):
 
             c.execute("UPDATE subcategories SET added = 0 WHERE name = ?;", (subcategory, ))
             conn.commit()
-            
+
         self.scraper.delete_subcategory(row[0])
         update.message.reply_text(f"The subcategory \"{subcategory}\" was successfuly removed")
 
@@ -292,20 +293,41 @@ class Bot(object):
             status = "Running"
 
         percentage = str(self.percentage * 100) + "%"
-        
-        update.message.reply_text(
-            f"Tracker Status: {status}\n" +
-            f"Current Percentage: {percentage}\n" +
-            "Subcategories:\n"
-        )
 
+        with sqlite3.connect(DATABASE) as conn:
+            c = conn.cursor()
+
+            c.execute("SELECT * from brands;")
+            brands = [row[0] for row in c.fetchall()]
+            if len(brands) == 0:
+                brands_str = " Empty\n"
+            else:
+                brands_str = "\n - " + "\n - ".join(brands) + "\n"
+        
         categories = self.my_subcategories_str()
-        for category in categories:
-            update.message.reply_text(category)
+        
+        if categories == ["\t\tEmpty"]:
+            update.message.reply_text(
+                f"Tracker Status: {status}\n" +
+                f"Current Percentage: {percentage}\n" +
+                "Brands:" + brands_str +
+                "Subcategories: Empty"
+            )
+        else:
+            update.message.reply_text(
+                f"Tracker Status: {status}\n" +
+                f"Current Percentage: {percentage}\n" +
+                "Brands:" + brands_str +
+                "Subcategories:\n"
+            )
+
+            categories = self.my_subcategories_str()
+            for category in categories:
+                update.message.reply_text(category)
         
     def change_percentage(self, update: Update, context: CallbackContext) -> None:
         if self.job_running is None:
-            update.message.reply_text('Sorry,, you need to start the tracker in order to change the price')
+            update.message.reply_text('Sorry, you need to start the tracker in order to change the price')
             return
 
         if len(context.args) != 1:
