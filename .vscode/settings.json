@@ -1,4 +1,3 @@
 {
-    "python.linting.enabled": true,
     "python.pythonPath": "/home/mateusap1/.virtualenvs/telegram_tracker/bin/python"
 }

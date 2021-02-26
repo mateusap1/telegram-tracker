@@ -1,6 +1,6 @@
+from scraping import Scraper
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-from scraping import Scraper
 
 import telegram
 import sqlite3
@@ -80,11 +80,11 @@ class Bot(object):
         with sqlite3.connect(DATABASE) as conn:
             c = conn.cursor()
 
-            c.execute("SELECT * FROM products")
+            c.execute("SELECT rowid, * FROM products")
             prod_rows = c.fetchall()
 
             for row in prod_rows:
-                product_id, product_name, last_price, current_price, \
+                row_id, product_id, product_name, last_price, current_price, \
                     merchant, url, subcategory_id = row
                 
                 if self.job_running is None:
@@ -108,29 +108,30 @@ class Bot(object):
                     )
 
                     c.execute(
-                        "UPDATE products SET last_price = ? WHERE product_id = ?",
-                        (current_price, product_id)
+                        "UPDATE products SET last_price = ? WHERE rowid = ?",
+                        (current_price, row_id)
                     )
             
             conn.commit()
 
     def price_tracking(self, context: CallbackContext) -> None:
-        with sqlite3.connect(DATABASE) as conn:
-            c = conn.cursor()
+        while True:
+            with sqlite3.connect(DATABASE) as conn:
+                c = conn.cursor()
 
-            c.execute("SELECT rowid, * FROM subcategories WHERE added = ?", (1, ))
-            subc_rows = c.fetchall()
-            subc_ids = [row[0] for row in subc_rows]
+                c.execute("SELECT rowid, * FROM subcategories WHERE added = ?", (1, ))
+                subc_rows = c.fetchall()
+                subc_ids = [row[0] for row in subc_rows]
 
-            c.execute("SELECT * FROM brands")
-            brand_rows = c.fetchall()
-            brands = [row[0] for row in brand_rows]
+                c.execute("SELECT * FROM brands")
+                brand_rows = c.fetchall()
+                brands = [row[0] for row in brand_rows]
 
-        print(subc_ids)
-        for subc_id in subc_ids:
-            self.scraper.get_products(subc_id, brands)
-        
-        self.compare_prices(context)
+            for row in subc_rows:
+                print(f"[Scraper] Subcategories \"{row[1]}\" are being scraped...")
+                self.scraper.get_products(subc_ids, brands)
+                print(f"[Scraper] Subcategories \"{row[1]}\" were successfuly scraped")
+                self.compare_prices(context)
     
     def start_bot(self, update: Update, context: CallbackContext) -> None:
         """Message the user when the price is low"""
@@ -160,10 +161,12 @@ class Bot(object):
         self.percentage = percentage / 100
         
         update.message.reply_text('Starting price tracker...')
+        print("[BOT] Starting price tracker...")
+
         self.job_running = self.job.run_repeating(
             self.price_tracking, 
             interval = self.delay, 
-            first = 0,
+            first = 5,
             context = update.message.chat_id
         )
     

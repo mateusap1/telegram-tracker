@@ -1,5 +1,5 @@
-import gevent.monkey
-gevent.monkey.patch_all(thread=True)
+# import gevent.monkey
+# gevent.monkey.patch_all(thread=False, select=True)
 
 from bot import Bot
 

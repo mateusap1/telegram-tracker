@@ -4,13 +4,16 @@ import csv
 import ast
 import time
 import grequests
+import concurrent.futures
 
 from requests_html import HTML
 from bs4 import BeautifulSoup
+from multiprocessing import Pool
+from itertools import product
 
 
 MAIN_URL = "https://www.hepsiburada.com/"
-MAX_REQUESTS = 25
+MAX_REQUESTS = 50
 TIMEOUT = 3
 LIMIT = 10
 HEADERS = {
@@ -44,6 +47,7 @@ class Scraper(object):
 
         with sqlite3.connect(self.database) as conn:
             c = conn.cursor()
+
             for product in self.products:
                 product_id, product_name, product_price, product_url, seller, subcategory_id = product
 
@@ -74,7 +78,7 @@ class Scraper(object):
 
         return r[0]
 
-    def make_requests(self):
+    def get_requests(self):
         r = grequests.map(self.requests, size=MAX_REQUESTS)
         self.requests = []
 
@@ -119,13 +123,17 @@ class Scraper(object):
     def create_subcategories(self) -> None:
         """Finds subcategories based on each category URL."""
 
-        index = 1
-        for name, url in self.get_categories().items():
-            with sqlite3.connect(self.database) as conn:
-                c = conn.cursor()
+        with sqlite3.connect(self.database) as conn:
+            c = conn.cursor()
+
+            for name, url in self.get_categories().items():
+                self.add_request(url)
                 c.execute("INSERT INTO categories VALUES (?, ?)", (name, url))
 
-                response = self.make_request(url)
+            # Gets all requests previously added asynchronously
+            responses = self.get_requests()
+            index = 1
+            for response in responses:
                 html = HTML(html=response.content)
 
                 a_elements = html.xpath("//div[@class='categories']/div/div/ul[@class='items']/li/a")
@@ -135,83 +143,93 @@ class Scraper(object):
 
                     c.execute("INSERT INTO subcategories VALUES (?, ?, ?, ?)", (sub_name, sub_url, index, 0))
                 
-                conn.commit()
-
-            index += 1
-
-    def get_products(self, subcategory_id: int, required_brands: list=[]) -> None:
-        """Add products from a subcategory to the db"""
-
-        print(subcategory_id)
-
-        with sqlite3.connect(self.database) as conn:
-            # Gets the subcategory based on the rowid
-            c = conn.cursor()
-            c.execute("SELECT * FROM subcategories where rowid = ?;", (subcategory_id,))
-            row = c.fetchone()
-
-            if row is None:
-                print("ERROR")
-                return
-
-            subcategory_url = row[1]
+                index += 1
+                
             conn.commit()
 
-        response = self.make_request(subcategory_url)
-        html = HTML(html=response.content)
+    def get_seller_products(self, seller, p_names, a_els, subcategory_id):
+        for a_el, p_name in zip(a_els, p_names):
+            if bool(a_el.attrs["data-isinstock"]) is True:
+                product_id = a_el.attrs["data-productid"]
+                product_name = p_name.attrs["title"]
+                product_price = float(a_el.attrs["data-price"].replace(",", "."))
+                product_url = MAIN_URL + a_el.attrs["href"]
+
+                return (
+                    product_id.lower(), 
+                    product_name, 
+                    product_price, 
+                    product_url, 
+                    seller, 
+                    subcategory_id
+                )
+            else:
+                return
+
+    def subcategory_scraping(self, args):
+        response = args[0]
+        row = args[1]
+        required_brands = args[2]
+
+        subcategory_name = row[1]
+        subcategory_url = row[2]
+        subcategory_id = row[0]
+
+        products = []
+
+        if response is not None:
+            if response.status_code == 200:
+                html = HTML(html=response.content)
+            else:
+                print(f"[Scraper] HTTP error {response.status_code} in subcategory {subcategory_name}")
+                return
+        else:
+            print("[Scraper] ERROR -> Response is None")
+            return
+
         seller_els = html.xpath("//li[@class='box-container satici']/ol/li")
 
         sellers = []
         for el in seller_els:
+            # Get sellers names
             if "title" in el.attrs:
                 sellers.append(el.attrs["title"])
 
-        brand_els = html.xpath("//li[@class='box-container brand']/ol/li")
         brands = []
-        for el in brand_els:
-            if "title" in el.attrs:
-                brand = el.attrs["title"]
-                if brand in required_brands:
-                    brands.append(brand)
+        if len(required_brands) > 0:
+            brand_els = html.xpath("//li[@class='box-container brand']/ol/li")
+            for el in brand_els:
+                # Get brand names
+                if "title" in el.attrs:
+                    brand = el.attrs["title"]
+                    if brand in required_brands:
+                        brands.append(brand)
 
         # Is the URL with the selected brands added
         brand_url = MAIN_URL + "-".join(brands) + "/" + subcategory_url.split("/")[-1]
-
-        def get_seller_products(seller, p_names, a_els):
-            for a_el, p_name in zip(a_els, p_names):
-                if bool(a_el.attrs["data-isinstock"]) is True:
-                    product_id = a_el.attrs["data-productid"]
-                    product_name = p_name.attrs["title"]
-                    product_price = float(a_el.attrs["data-price"])
-                    product_url = MAIN_URL + a_el.attrs["href"]
-
-                    # TODO: Maybe the problem was commiting to the db every time
-                    self.products.append((
-                        product_id.lower(), 
-                        product_name, 
-                        product_price, 
-                        product_url, 
-                        seller, 
-                        subcategory_id
-                    ))
-                else:
-                    print("ERROR")
         
         if len(sellers) == 0:
-            print("ERROR")
+            print("[Scraping] ERROR -> There are no sellers in this page")
             return
 
         for seller in sellers:
             seller_url = brand_url + "?filtreler=satici:" + seller
             self.add_request(seller_url)
         
-        responses = self.make_requests()
+        responses = self.get_requests()
 
         sellers_ext = []
         for seller, response in zip(sellers, responses):
             seller_url = brand_url + "?filtreler=satici:" + seller
 
-            html = HTML(html=response.content)
+            if response is not None:
+                if response.status_code == 200:
+                    html = HTML(html=response.content)
+                else:
+                    print(f"[Scraper] HTTP error {response.status_code} in subcategory {subcategory_name}")
+                    continue
+            else:
+                print("[Scraper] ERROR -> Response is None")
 
             a_els = html.xpath("//div[@id='pagination']/ul/li/a")
             if len(a_els) > 0:
@@ -224,27 +242,79 @@ class Scraper(object):
                 self.add_request(current_url)
                 sellers_ext.append(seller)
 
-        responses = self.make_requests()
+        responses = self.get_requests()
+
+        a_els_group = []
+        p_names = []
+        for response, seller in zip(sellers_ext, responses):
+            if not responses[i] is None:
+                if responses[i].status_code == 200:
+                    html = HTML(html=responses[i].content)
+                else:
+                    print(f"[Scraper] HTTP error {responses[i].status_code} in subcategory {subcategory_name}")
+                    continue
+            else:
+                print("[Scraper] ERROR -> Response is None")
+
+            p_names.append(html.xpath("//h3[@class='product-title title']"))
+            a_els_group.append(html.xpath("//div[@class='box product hb-placeholder']/a"))
+        
+        for seller, p_name, a_els in zip(sellers_ext, p_names, a_els_group):
+            products.append(self.get_seller_products(seller, p_name, a_els, subcategory_id))
+        
+        return products
+
+    def get_products(self, subcategory_ids: list, required_brands: list=[]) -> None:
+        """Add products from a subcategory to the db"""
 
         with sqlite3.connect(self.database) as conn:
-            a_els_group = []
-            p_names = []
-            for i, seller in enumerate(sellers_ext):
-                html = HTML(html=responses[i].content)
+            # Gets the subcategory based on the rowid
+            c = conn.cursor()
+            q_marks = ", ".join(["?" for _ in range(len(subcategory_ids))])
+            c.execute(f"SELECT rowid, * FROM subcategories WHERE rowid IN ({q_marks});", subcategory_ids)
+            rows = c.fetchall()
 
-                p_names.append(html.xpath("//h3[@class='product-title title']"))
-                a_els_group.append(html.xpath("//div[@class='box product hb-placeholder']/a"))
-            
-            for seller, p_name, a_els in zip(sellers_ext, p_names, a_els_group):
-                get_seller_products(seller, p_name, a_els)
-            
+            if len(rows) == 0:
+                print("[Scraping] Subcategory IDs don't exist")
+                return
+        
+        for row in rows:
+            # Adding a request for each URL from the subcategories
+            self.add_request(row[2])
+        
+        responses = self.get_requests()
+
+        pool = Pool(processes=4)
+        product_lists = pool.map(self.subcategory_scraping, zip(responses, rows, [required_brands for _ in range(len(rows))]))
+        pool.close()
+        pool.join()
+
+        # with concurrent.futures.ThreadPoolExecutor() as executor:
+        #     product_lists = executor.map(self.subcategory_scraping, zip(responses, rows, [required_brands for _ in range(len(rows))]))
+
+        for product_list in product_lists:
+            for product in product_list:
+                if not product is None:
+                    self.products.append(product)
+
         self.execute_queries()
         self.add_products()
 
-    def delete_subcategory(self, subcategory_id: int) -> None:
+    def delete_subcategories(self, subcategory_ids: list) -> None:
         with sqlite3.connect(self.database) as conn:
             c = conn.cursor()
 
-            c.execute("DELETE FROM products WHERE subcategory_id = ?;", (subcategory_id,))
+            q_marks = ", ".join(["?" for _ in range(len(subcategory_ids))])
+            c.execute(f"DELETE FROM products WHERE subcategory_id IN ({q_marks});", subcategory_ids)
 
             conn.commit()
+
+
+def main():
+    scraper = Scraper("./data/database.db")
+
+    scraper.get_products([i for i in range(1, 8)])
+
+
+if __name__ == "__main__":
+    main()
