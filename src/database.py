@@ -12,31 +12,12 @@ with sqlite3.connect("./data/database.db") as conn:
         current_price REAL,
         merchant TEXT,
         url TEXT,
-        subcategory_id INTEGER
-    )
-    """)
-
-    c.execute("""CREATE TABLE categories (
-        name TEXT,
-        url TEXT
-    )
-    """)
-
-    c.execute("""CREATE TABLE subcategories (
-        name TEXT,
-        url TEXT,
-        category_id INTEGER,
-        added INTEGER
+        url_id INTEGER
     )
     """)
 
     c.execute("""CREATE TABLE urls (
         url TEXT
-    )
-    """)
-
-    c.execute("""CREATE TABLE brands (
-        name TEXT
     )
     """)
 
