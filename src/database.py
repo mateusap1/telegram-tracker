@@ -6,6 +6,7 @@ with sqlite3.connect("./data/database.db") as conn:
 
     c.execute("""CREATE TABLE products (
         product_id TEXT,
+        listing_id TEXT,
         product_name TEXT,
         last_price REAL,
         current_price REAL,
