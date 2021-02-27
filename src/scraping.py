@@ -298,6 +298,6 @@ class Scraper(object):
 
 if __name__ == "__main__":
     scraper = Scraper("./data/database.db")
-    # scraper.add_subcategories([i for i in range(1, 31)])
-    # scraper.delete_subcategories([i for i in range(1, 150)])
+    scraper.delete_subcategories([i for i in range(1, 150)])
+    scraper.add_subcategories([i for i in range(1, 31)])
     # scraper.create_subcategories()
