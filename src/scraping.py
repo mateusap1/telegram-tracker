@@ -1,17 +1,13 @@
 import random
 import sqlite3
-import csv
 import ast
 import time
 import requests
 import concurrent.futures
-import lxml.html, lxml.etree
+import lxml.html
 import sys
 
-from requests_html import HTML
 from bs4 import BeautifulSoup
-from multiprocessing import Pool
-from itertools import product
 
 
 MAIN_URL = "https://www.hepsiburada.com/"
@@ -31,10 +27,22 @@ class Scraper(object):
     def __init__(self, database: str):
         self.database = database
 
-        self.session = requests.session()
-        self.queries = []
         self.products = []
     
+    def random_proxy(self):
+        with sqlite3.connect(self.database) as conn:
+            c = conn.cursor()
+
+            c.execute("SELECT url FROM proxies")
+            proxies = [row[0] for row in c.fetchall()]
+
+            if len(proxies) == 0:
+                return None
+
+            proxy = random.choice(proxies)
+
+            return proxy
+  
     def add_products(self) -> None:
         """Adds product if it is not already in the table"""
 
@@ -126,6 +134,64 @@ class Scraper(object):
                 
             conn.commit()
 
+    def page_scraping(self, url):
+        proxy = self.random_proxy()
+
+        if proxy is not None:
+            proxies = {
+                "http": proxy,
+                "https": proxy
+            }
+        else:
+            proxies = None
+
+        response = requests.get(url, headers=HEADERS, proxies=proxies)
+
+        if not response is None:
+            if response.status_code == 200:
+                html = lxml.html.fromstring(response.content)
+            else:
+                print(f"[Scraper] HTTP error {response.status_code} in subcategory {subcategory_name}")
+                return
+        else:
+            print("[Scraper] ERROR -> Response is None")
+
+        # Get the product name
+        p_names = html.xpath(".//h3[@class='product-title title']")
+
+        # Get the product info
+        a_els = html.xpath(".//a[@data-isinstock='True']")
+
+        button_els = html.xpath(".//button[@class='add-to-basket button small']")
+        
+        i = 0
+        for p_name, a_el in zip(p_names, a_els):
+            if len(button_els) == len(a_els) == len(p_names):
+                product_info = ast.literal_eval(button_els[i].get("data-product"))
+                seller = product_info["merchantName"]
+                product_price = float(product_info["price"])
+            else:
+                seller = None
+                product_price = float(a_el.get("data-price").replace(",", "."))
+
+            listing_id = a_el.get("data-listing_id").lower()
+            product_id = a_el.get("data-productid").lower()
+
+            product_url = MAIN_URL + a_el.get("href")
+            product_name = p_name.get("title")
+
+            self.products.append((
+                product_id, 
+                listing_id,
+                product_name, 
+                product_price, 
+                product_url, 
+                seller, 
+                None
+            ))
+
+            i += 1
+
     def subcategory_scraping(self, args):
         try:
             row = args[0]
@@ -141,16 +207,25 @@ class Scraper(object):
             # Is the URL with the selected brands added
             brand_url = MAIN_URL + "-".join(brands) + "/" + subcategory_url.split("/")[-1]
 
-            response = requests.get(brand_url, headers=HEADERS)
+            proxy = self.random_proxy()
+            if proxy is not None:
+                proxies = {
+                    "http": proxy,
+                    "https": proxy
+                }
+            else:
+                proxies = None
+
+            response = requests.get(brand_url, headers=HEADERS, proxies=proxies)
 
             if response is not None:
                 if response.status_code == 200:
                     html = lxml.html.fromstring(response.content)
                 else:
-                    print(f"[Scraper] HTTP error {response.status_code} in subcategory {subcategory_name}")
+                    print(f"[Debugging] HTTP error {response.status_code} in subcategory {subcategory_name}")
                     return
             else:
-                print("[Scraper] ERROR -> Response is None")
+                print("[Debugging] ERROR -> Response is None")
                 return
 
             pages_el = html.xpath("//div[@id='pagination']/ul/li/a")
@@ -162,31 +237,36 @@ class Scraper(object):
             for i in range(1, page_limit+1):
                 url = brand_url + f"?sayfa={i}"
 
-                response = requests.get(url, headers=HEADERS)
+                response = requests.get(url, headers=HEADERS, proxies=proxies)
 
                 if not response is None:
                     if response.status_code == 200:
                         html = lxml.html.fromstring(response.content)
                     else:
-                        print(f"[Scraper] HTTP error {response.status_code} in subcategory {subcategory_name}")
+                        print(f"[Debugging] HTTP error {response.status_code} in subcategory {subcategory_name}")
                         continue
                 else:
-                    print("[Scraper] ERROR -> Response is None")
+                    print("[Debugging] ERROR -> Response is None")
+                    continue
 
                 # Get the product name
-                p_names = html.xpath(".//h3[@class='product-title title']")
+                p_names = html.xpath("//h3[@class='product-title title']")
 
                 # Get the product info
-                a_els = html.xpath(".//a[@data-isinstock='True']")
+                a_els = html.xpath("//a[@data-isinstock='True']")
 
-                button_els = html.xpath(".//button[@class='add-to-basket button small']")
+                button_els = html.xpath("//button[@class='add-to-basket button small']")
                 
                 j = 0
                 for p_name, a_el in zip(p_names, a_els):
                     if len(button_els) == len(a_els) == len(p_names):
-                        product_info = ast.literal_eval(button_els[j].get("data-product"))
-                        seller = product_info["merchantName"]
-                        product_price = float(product_info["price"])
+                        try:
+                            product_info = ast.literal_eval(button_els[j].get("data-product"))
+                            seller = product_info["merchantName"]
+                            product_price = float(product_info["price"])
+                        except ValueError:
+                            seller = None
+                            product_price = float(a_el.get("data-price").replace(",", "."))
                     else:
                         seller = None
                         product_price = float(a_el.get("data-price").replace(",", "."))
@@ -214,7 +294,7 @@ class Scraper(object):
             return products
 
         except Exception as e:
-            print(f"[Scraper] Error while scraping subcategory -> \"{e}\"")
+            print(f"[Debugging] Error while scraping subcategory -> \"{e}\"")
 
     def get_products(self, unused) -> None:
         """Add products from a subcategory to the db"""
@@ -237,7 +317,6 @@ class Scraper(object):
         required_brands = [row[0] for row in brand_rows]
         args = zip(subc_rows, [required_brands for _ in range(len(subc_rows))])
 
-
         with concurrent.futures.ThreadPoolExecutor() as executor:
             executor.map(self.subcategory_scraping, args)
 
@@ -245,7 +324,16 @@ class Scraper(object):
         print(f"[Scraper] Cycle completed successfuly in {end - start} seconds.")
 
     def get_product_info(self, url: str) -> dict:
-        response = requests.get(url, headers=HEADERS)
+        proxy = self.random_proxy()
+        if proxy is not None:
+            proxies = {
+                "http": proxy,
+                "https": proxy
+            }
+        else:
+            proxies = None
+
+        response = requests.get(url, headers=HEADERS, proxies=proxies)
 
         if response is not None:
             if response.status_code == 200:
@@ -294,10 +382,3 @@ class Scraper(object):
             c.execute(f"UPDATE subcategories SET added = 0 WHERE rowid IN ({q_marks});", subcategory_ids)
 
             conn.commit()
-
-
-if __name__ == "__main__":
-    scraper = Scraper("./data/database.db")
-    scraper.delete_subcategories([i for i in range(1, 150)])
-    scraper.add_subcategories([i for i in range(1, 31)])
-    # scraper.create_subcategories()

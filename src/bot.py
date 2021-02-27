@@ -310,7 +310,7 @@ class Bot(object):
             conn.commit()
 
             update.message.reply_text(f"The brand \"{brand}\" was successfuly removed")
-    
+
     def get_status(self, update: Update, context: CallbackContext) -> None:
         if len(self.jobs_running) == 0:
             status = "Stopped"

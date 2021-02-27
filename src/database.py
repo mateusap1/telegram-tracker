@@ -30,7 +30,17 @@ with sqlite3.connect("./data/database.db") as conn:
     )
     """)
 
+    c.execute("""CREATE TABLE urls (
+        url TEXT
+    )
+    """)
+
     c.execute("""CREATE TABLE brands (
         name TEXT
+    )
+    """)
+
+    c.execute("""CREATE TABLE proxies (
+        url TEXT
     )
     """)
