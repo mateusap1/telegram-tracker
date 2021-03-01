@@ -24,6 +24,9 @@ class Bot(object):
         if len(self.scraper.products) > 0:
             self.scraper.add_products()
             print("[Scraper] Products added successfuly")
+        
+        if len(self.scraper.queries) > 0:
+            self.scraper.execute_queries()
 
         job = context.job
 
@@ -34,37 +37,34 @@ class Bot(object):
             prod_rows = c.fetchall()
 
             for row in prod_rows:
-                row_id, product_id, listing_id, product_name, last_price, \
-                    current_price, merchant, url, url_id = row
+                row_id, product_id, product_name, last_price, \
+                    current_price, seller, url, url_id = row
                 
                 if len(self.jobs_running) == 0:
                     return
+
+                c.execute("SELECT first_cycle FROM urls WHERE rowid = ?", (url_id, ))
+                first_cycle = bool(c.fetchone()[0])
                 
+                # if last_price is None and first_cycle is False:
+                #     info = self.scraper.get_product_info(url)
+                #     seller = info["seller"]
+
+                #     if seller.lower() == "hepsiburada":
+                #         message = product_name + "\n\n" + \
+                #             str(current_price) + " TL\n\n" + \
+                #             url + "?magaza=Hepsiburada\n\n"
+
+                #         context.bot.send_message(
+                #             chat_id = job.context, 
+                #             text = message
+                #         )
+
                 price_difference = last_price - current_price
                 percentage = price_difference / last_price
                 percentage_str = str("%.2f" % (percentage * 100))
 
                 if percentage >= self.percentage:
-                    info = self.scraper.get_product_info(url)
-                    real_price = info["price"]
-                    seller = info["seller"]
-
-                    # TODO: See why it's not working properly
-
-                    if current_price != real_price:
-                        c.execute(
-                            "UPDATE products SET current_price = ? WHERE listing_id = ?",
-                            (real_price, listing_id)
-                        )
-                    
-                    price_difference = last_price - real_price
-
-                    real_percentage = price_difference / last_price
-                    if percentage < self.percentage:
-                        return
-
-                    percentage_str = str("%.2f" % (percentage * 100))
-                    
                     print(f"[Bot] Price of \"{product_name}\" is {percentage_str}% off")
 
                     message = product_name + "\n\n" + \
@@ -80,8 +80,8 @@ class Bot(object):
                     )
 
                     c.execute(
-                        "UPDATE products SET last_price = ? WHERE listing_id = ?",
-                        (current_price, listing_id)
+                        "UPDATE products SET last_price = ? WHERE product_id = ?",
+                        (current_price, product_id)
                     )
             
             conn.commit()
@@ -161,7 +161,7 @@ class Bot(object):
             urls = context.args
 
             for url in urls:
-                c.execute("INSERT INTO urls VALUES (?);", (url, ))
+                c.execute("INSERT INTO urls VALUES (?, ?);", (url, 0))
 
             conn.commit()
 
@@ -184,6 +184,42 @@ class Bot(object):
 
         print(f"[Bot] URL(s) successfuly removed from the database")
         update.message.reply_text(f"URL(s) successfuly removed")
+
+    def add_proxies(self, update: Update, context: CallbackContext) -> None:
+        if len(context.args) < 1:
+            update.message.reply_text(
+                "Sorry, you must pass the proxies as arguments\n" + 
+                "e.g. /addproxies <proxy1> <proxy2> <...>"
+            )
+            return
+
+        proxies = context.args
+
+        with sqlite3.connect(DATABASE) as conn:
+            c = conn.cursor()
+
+            for proxy in proxies:
+                c.execute("INSERT INTO proxies VALUES (?);", (proxy, ))
+
+        print(f"[Bot] Proxies successfuly added to the database")
+        update.message.reply_text(f"Proxies added successfuly")
+    
+    def clear_proxies(self, update: Update, context: CallbackContext) -> None:
+        if len(context.args) < 1:
+            update.message.reply_text(
+                "Sorry, you must pass the proxies as arguments\n" + 
+                "e.g. /addproxies <proxy1> <proxy2> <...>"
+            )
+            return
+
+        proxies = context.args
+
+        with sqlite3.connect(DATABASE) as conn:
+            c = conn.cursor()
+            c.execute(f"DELETE FROM proxies;")
+
+        print(f"[Bot] Proxies table successfuly cleared")
+        update.message.reply_text(f"Proxies table successfuly cleared")
 
     def get_status(self, update: Update, context: CallbackContext) -> None:
         if len(self.jobs_running) == 0:
@@ -257,7 +293,7 @@ class Bot(object):
     def start(self):
         print("[Bot] Starting bot...")
 
-        updater = Updater("1549588597:AAHsFKTLD6glkm1EWPL_qWPkLgXnwEx01r8", use_context=True)
+        updater = Updater("1549588597:AAHsFKTLD6glkm1EWPL_qWPkLgXnwEx01r8")
         self.job = updater.job_queue
 
         # Get the dispatcher to register handlers
@@ -269,6 +305,9 @@ class Bot(object):
 
         dispatcher.add_handler(CommandHandler("addurls", self.add_urls))
         dispatcher.add_handler(CommandHandler("removeurls", self.remove_urls))
+
+        dispatcher.add_handler(CommandHandler("addproxies", self.add_proxies))
+        dispatcher.add_handler(CommandHandler("clearproxies", self.clear_proxies))
 
         dispatcher.add_handler(CommandHandler("changepercentage", self.change_percentage))
 
