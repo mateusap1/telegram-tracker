@@ -17,72 +17,75 @@ class Bot(object):
         self.jobs_running = []
         self.percentage = 0
         self.delay = 30
+        self.mode = "track"
 
     def compare_prices(self, context: CallbackContext) -> None:
         """Check the database to see if any product is with a low price"""
 
+        job = context.job
+        
         if len(self.scraper.products) > 0:
             self.scraper.add_products()
-            print("[Scraper] Products added successfuly")
+            print("[Bot] Products added successfuly")
         
         if len(self.scraper.queries) > 0:
             self.scraper.execute_queries()
-
-        job = context.job
-
+        
         with sqlite3.connect(DATABASE) as conn:
             c = conn.cursor()
 
-            c.execute("SELECT rowid, * FROM products")
-            prod_rows = c.fetchall()
+            c.execute("SELECT rowid, * FROM urls;")
+            self.scraper.url_rows = c.fetchall()
+        
+            if self.mode == "warn":
+                new_products = self.scraper.new_products.copy()
+                self.scraper.new_products = []
 
-            for row in prod_rows:
-                row_id, product_id, product_name, last_price, \
-                    current_price, seller, url, url_id = row
-                
-                if len(self.jobs_running) == 0:
-                    return
-
-                c.execute("SELECT first_cycle FROM urls WHERE rowid = ?", (url_id, ))
-                first_cycle = bool(c.fetchone()[0])
-                
-                # if last_price is None and first_cycle is False:
-                #     info = self.scraper.get_product_info(url)
-                #     seller = info["seller"]
-
-                #     if seller.lower() == "hepsiburada":
-                #         message = product_name + "\n\n" + \
-                #             str(current_price) + " TL\n\n" + \
-                #             url + "?magaza=Hepsiburada\n\n"
-
-                #         context.bot.send_message(
-                #             chat_id = job.context, 
-                #             text = message
-                #         )
-
-                price_difference = last_price - current_price
-                percentage = price_difference / last_price
-                percentage_str = str("%.2f" % (percentage * 100))
-
-                if percentage >= self.percentage:
-                    print(f"[Bot] Price of \"{product_name}\" is {percentage_str}% off")
+                for product in new_products:
+                    product_id, product_name, product_price, product_url, seller, url_id = product
 
                     message = product_name + "\n\n" + \
-                        "Satıcı: " + seller + "\n\n" + \
-                        str(last_price) + " TL >>>> " + \
-                        str(current_price) + f" TL - {percentage_str}%" + "\n\n" + \
-                        url + "\n\n" + \
-                        MAIN_URL + "ara?q=" + product_id
+                        str(product_price) + " TL\n\n" + \
+                        product_url + "?magaza=Hepsiburada\n\n"
 
                     context.bot.send_message(
                         chat_id = job.context, 
                         text = message
                     )
+            elif self.mode == "track":
+                c.execute("SELECT rowid, * FROM products")
+                prod_rows = c.fetchall()
 
-                    c.execute(
-                        "UPDATE products SET last_price = ? WHERE product_id = ?",
-                        (current_price, product_id)
-                    )
+                for row in prod_rows:
+                    row_id, product_id, product_name, last_price, \
+                        current_price, seller, url, url_id = row
+                    
+                    if len(self.jobs_running) == 0:
+                        return
+
+                    price_difference = last_price - current_price
+                    percentage = price_difference / last_price
+                    percentage_str = str("%.2f" % (percentage * 100))
+
+                    if percentage >= self.percentage:
+                        print(f"[Bot] Price of \"{product_name}\" is {percentage_str}% off")
+
+                        message = product_name + "\n\n" + \
+                            "Satıcı: " + seller + "\n\n" + \
+                            str(last_price) + " TL >>>> " + \
+                            str(current_price) + f" TL - {percentage_str}%" + "\n\n" + \
+                            url + "\n\n" + \
+                            MAIN_URL + "ara?q=" + product_id
+
+                        context.bot.send_message(
+                            chat_id = job.context, 
+                            text = message
+                        )
+
+                        c.execute(
+                            "UPDATE products SET last_price = ? WHERE product_id = ?",
+                            (current_price, product_id)
+                        )
             
             conn.commit()
     
@@ -91,30 +94,54 @@ class Bot(object):
         if len(self.jobs_running) == 2:
             update.message.reply_text('Sorry, the price tracker is already running')
             return
-
-        if len(context.args) != 1:
+        
+        if len(context.args) < 1:
             update.message.reply_text(
-                'Sorry, you need to pass the percentage as an argument.\n' +
-                'e.g. /start 20%'
+                'Sorry, you need to pass the bot mode as an argument.\n' +
+                'e.g. /start warn or /start track 50%'
             )
             return
-        
-        percentage = context.args[0].replace("%", "")
 
-        try:
-            percentage = float(percentage)
-        except ValueError:
-            update.message.reply_text('Sorry, your argument must be a percentage number')
-            return
+        mode = context.args[0].lower()
 
-        if percentage < 0 or percentage > 100:
-            update.message.reply_text('Sorry, the percentage must be between 0 and 100 percent')
-            return
+        if mode == "warn":
+            self.mode = "warn"
+
+            update.message.reply_text('Starting products tracking...')
+            print("[Bot] Starting products tracking...")
+
+        elif mode == "track":
+            if len(context.args) != 2:
+                update.message.reply_text(
+                    'Sorry, you need to pass the percentage as an argument.\n' +
+                    'e.g. /start track 20%'
+                )
+                return
+            
+            self.mode = "track"
+
+            percentage = context.args[1].replace("%", "")
+
+            try:
+                percentage = float(percentage)
+            except ValueError:
+                update.message.reply_text('Sorry, your argument must be a percentage number')
+                return
+
+            if percentage < 0 or percentage > 100:
+                update.message.reply_text('Sorry, the percentage must be between 0 and 100 percent')
+                return
+            
+            self.percentage = percentage / 100
+
+            update.message.reply_text('Starting price tracking...')
+            print("[Bot] Starting price tracking...")
         
-        self.percentage = percentage / 100
-        
-        update.message.reply_text('Starting price tracker...')
-        print("[Bot] Starting price tracker...")
+        else:
+            update.message.reply_text(
+                'Sorry, you need to passa valid argument.\n' +
+                'Valid arguments: "track", "warn"'
+            )
 
         self.jobs_running.append(
             self.job.run_repeating(
@@ -161,7 +188,7 @@ class Bot(object):
             urls = context.args
 
             for url in urls:
-                c.execute("INSERT INTO urls VALUES (?, ?);", (url, 0))
+                c.execute("INSERT INTO urls VALUES (?, ?);", (url, 1))
 
             conn.commit()
 
@@ -205,15 +232,6 @@ class Bot(object):
         update.message.reply_text(f"Proxies added successfuly")
     
     def clear_proxies(self, update: Update, context: CallbackContext) -> None:
-        if len(context.args) < 1:
-            update.message.reply_text(
-                "Sorry, you must pass the proxies as arguments\n" + 
-                "e.g. /addproxies <proxy1> <proxy2> <...>"
-            )
-            return
-
-        proxies = context.args
-
         with sqlite3.connect(DATABASE) as conn:
             c = conn.cursor()
             c.execute(f"DELETE FROM proxies;")
@@ -281,8 +299,9 @@ class Bot(object):
     def help_command(self, update: Update, context: CallbackContext) -> None:
         """Send a message when the command /help is issued."""
         update.message.reply_text(
-            "/start <percentage>: messages the user when the price is lower than " +
-            "the original price by a given percentage\n" +
+            "/start <mode> <percentage (if needed)>: if the mode is \"warn\"," +
+            "it will warn the user whenever a new product is added. If the mode is \"track\"," +
+            "it will warn the use whenever a price drops.\n"
             "/stop: stops tracking price loop\n" +
             "/addurls <URL1> <URL2> <...>: add URL(s) to the list\n" +
             "/removeurls <URL1> <URL2> <...>: remove URL(s) from the list\n" +

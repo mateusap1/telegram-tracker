@@ -8,14 +8,15 @@ import lxml.html
 import re
 import json
 import unicodedata
+import random
 
 from bs4 import BeautifulSoup
 
 
 MAIN_URL = "https://www.hepsiburada.com/"
-TIMEOUT = 10
-TIMEOUT_THREADS = 360
-INFINITE = 10 ** 6
+TIMEOUT = 5
+TIMEOUT_THREADS = 40
+INFINIT = 10 ** 6
 HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
     "Connection": "keep-alive",
@@ -31,7 +32,9 @@ class Scraper(object):
         self.database = database
 
         self.products = []
+        self.new_products = []
         self.queries = []
+        self.url_rows = []
     
     def random_proxy(self):
         with sqlite3.connect(self.database) as conn:
@@ -63,21 +66,30 @@ class Scraper(object):
         with sqlite3.connect(self.database) as conn:
             c = conn.cursor()
 
+            c.execute("SELECT rowid FROM urls WHERE first_cycle = 1;")
+            first_ids = [row[0] for row in c.fetchall()]
+
+            c.execute(f"SELECT product_id FROM products;")
+            old_products_ids = [row[0] for row in c.fetchall()]
+
             products = self.products.copy()
             self.products = []
 
             for product in products:
                 product_id, product_name, product_price, product_url, seller, url_id = product
 
-                c.execute("SELECT * FROM products WHERE product_id = ?", (product_id, ))
+                if not (product_id in old_products_ids) and seller.lower() == "hepsiburada" and not (url_id in first_ids):
+                    self.new_products.append(product)
+
+                c.execute("SELECT * FROM products WHERE product_id = ?;", (product_id, ))
                 if len(c.fetchall()) > 0:
                     c.execute(
-                        "UPDATE products SET current_price = ? WHERE product_id = ?", 
+                        "UPDATE products SET current_price = ? WHERE product_id = ?;", 
                         (product_price, product_id)
                     )
                 else:
                     c.execute(
-                        "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", (
+                        "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?);", (
                             product_id, 
                             product_name,
                             product_price,
@@ -110,6 +122,9 @@ class Scraper(object):
         variants = final["data"]["selectedVariant"]["variantListing"]
         sellers = {}
 
+        if variants is None:
+            return None
+
         for variant in variants:
             sellers[variant["merchantName"]] = variant["finalPriceOnSale"]
 
@@ -137,30 +152,27 @@ class Scraper(object):
             return None
         
         title = html.xpath("//h1[@id='product-name']/text()")
-        if len(title) == 0 or title is None:
-            print(f"[Debugging] Title not found in URL {url}")
+        if title is None or len(title) == 0:
             return None
         else:
             title = unicodedata.normalize("NFKD", title[0].strip("\r\n" + " " * 8))
         
         sellers = self.get_sellers(response.text)
 
-        if len(sellers) == 0 or sellers is None:
-            price_els = html.xpath("//span[@id='offering-price']/@content")
-            if len(price_els) > 0:
+        if sellers is None or len(sellers) == 0:
+            price_els = html.xpath("//span[@id='offering-price']")
+            if price_els is not None and len(price_els) > 0:
                 price = price_els[0].get("content")
             else:
-                print(f"[Debugging] Price not found in URL {url}")
                 return None
 
             seller_els = html.xpath("//span[@class='seller']/span/a/text()")
-            if len(seller_els) > 0:
+            if seller_els is not None and len(seller_els) > 0:
                 seller = seller_els[0].strip("\r\n" + " " * 8)
             else:
-                print(f"[Debugging] Seller not found in URL {url}")
                 return None
         else:
-            price = INFINITE
+            price = INFINIT
             seller = None
 
             for current_seller, current_price in sellers.items():
@@ -169,7 +181,6 @@ class Scraper(object):
                     seller = current_seller
         
         if seller is None:
-            print(f"[Debugging] Seller not found in URL {url}")
             return None
         
         return {
@@ -215,13 +226,13 @@ class Scraper(object):
                 return
 
             pages_el = html.xpath("//div[@id='pagination']/ul/li/a")
-            if len(pages_el) == 0 or pages_el is None:
+            if pages_el is None or len(pages_el) == 0:
                 page_limit = 1
             else:
                 page_limit = int(pages_el[-1].text) # The number of different product pages
 
             for i in range(1, page_limit+1):
-                if time.time() - start > TIMEOUT_THREADS:
+                if (time.time() - start) > (TIMEOUT_THREADS * page_limit):
                     print(f"[Debugging] Timeout reached on URL {url}")
                     return
 
@@ -249,23 +260,22 @@ class Scraper(object):
                 a_els = html.xpath(".//a[@data-isinstock='True']")
                 if a_els is None:
                     print(f"[Debugging] No products found in URL {current_url}")
-                    return
+                    continue
 
                 for a_el in a_els:
                     href = a_el.get("href")
-                    for i, part in enumerate(href.split("-")):
-                        if part == "p":
-                            product_id = href.split("-")[i+1].lower()
+                    product_id = a_el.get("data-productid").lower()
+
+                    if href is None:
+                        continue
 
                     if product_id is None:
-                        print(f"[Debugging] No product id found in URL {current_url}")
                         continue
 
                     product_url = MAIN_URL[:-1] + href
 
                     info = self.get_product_info(product_url)
                     if info is None:
-                        print(f"[Debugging] No info found in product with URL {product_url}")
                         continue
 
                     self.products.append((
@@ -277,7 +287,7 @@ class Scraper(object):
                         url_id
                     ))
             
-            self.queries.append(("UPDATE urls SET first_cycle = 1 WHERE rowid = ?", (url_id, )))
+            self.queries.append(("UPDATE urls SET first_cycle = 0 WHERE rowid = ?", (url_id, )))
                 
             print(f"[Scraper] URL {url} was successfuly scraped")
 
@@ -290,28 +300,15 @@ class Scraper(object):
         # Argument `unused` has no real value
         start = time.time()
 
-        # TODO: Remove sqlite3 from this method
-        with sqlite3.connect(self.database) as conn:
-            c = conn.cursor()
+        if len(self.url_rows) == 0:
+            return
 
-            c.execute("SELECT rowid, * FROM urls;")
-            url_rows = c.fetchall()
+        proxies = [self.random_proxy() for _ in range(len(self.url_rows))]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            executor.map(self.url_scraping, zip(self.url_rows, proxies))
 
-            c.execute("SELECT * FROM products;")
-            product_rows = c.fetchall()
-
-            if len(url_rows) == 0:
-                return
-            
-            if len(product_rows) == 0:
-                self.first_cycle = True
-
-            proxies = [self.random_proxy() for _ in range(len(url_rows))]
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                executor.map(self.url_scraping, zip(url_rows, proxies))
-
-            end = time.time()
-            print(f"[Scraper] Cycle completed successfuly in {end - start} seconds.")
+        end = time.time()
+        print(f"[Scraper] Cycle completed successfuly in {end - start} seconds.")
 
     def delete_urls(self, urls: list) -> None:
         with sqlite3.connect(self.database) as conn:
@@ -349,4 +346,3 @@ class Scraper(object):
 if __name__ == "__main__":
     scraper = Scraper("./data/database.db")
     scraper.clean_db()
-    scraper.get_product_info("https://www.hepsiburada.com/regal-nf-3020-a-300-lt-no-frost-buzdolabi-p-HBV00000ULL5K")
