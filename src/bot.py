@@ -4,9 +4,18 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, Callb
 
 import telegram
 import sqlite3
+import datetime
+import configparser
+import builtins
 
 
-MAIN_URL = 'https://www.hepsiburada.com/'
+config = configparser.ConfigParser()
+config.read("./config.ini")
+
+CHANNEL_ID = config.get("DEFAULT", "channel_id")
+API_KEY = config.get("DEFAULT", "bot_key")
+DELAY = config.getfloat("DEFAULT", "cycle_delay")
+MAIN_URL = 'http://www.hepsiburada.com/'
 DATABASE = "./data/database.db"
 
 
@@ -16,8 +25,8 @@ class Bot(object):
         self.scraper = Scraper(DATABASE)
         self.jobs_running = []
         self.percentage = 0
-        self.delay = 30
-        self.mode = "track"
+        self.delay = DELAY
+        self.mode = None
 
     def compare_prices(self, context: CallbackContext) -> None:
         """Check the database to see if any product is with a low price"""
@@ -37,68 +46,86 @@ class Bot(object):
             c.execute("SELECT rowid, * FROM urls;")
             self.scraper.url_rows = c.fetchall()
         
-            if self.mode == "warn":
+            if self.mode == "warn" or self.mode == "warn-track":
                 new_products = self.scraper.new_products.copy()
                 self.scraper.new_products = []
 
                 for product in new_products:
-                    product_id, product_name, product_price, product_url, seller, url_id = product
+                    date, product_id, product_name, product_price, product_url, url_id = product
 
                     message = product_name + "\n\n" + \
                         str(product_price) + " TL\n\n" + \
                         product_url + "?magaza=Hepsiburada\n\n"
 
                     context.bot.send_message(
-                        chat_id = job.context, 
+                        chat_id = CHANNEL_ID, 
                         text = message
                     )
-            elif self.mode == "track":
-                c.execute("SELECT rowid, * FROM products")
+
+            if self.mode == "track" or self.mode == "warn-track":
+                c.execute("SELECT DISTINCT product_id FROM products")
                 prod_rows = c.fetchall()
 
                 for row in prod_rows:
-                    row_id, product_id, product_name, last_price, \
-                        current_price, seller, url, url_id = row
+                    product_id = row[0]
                     
                     if len(self.jobs_running) == 0:
                         return
 
-                    price_difference = last_price - current_price
-                    percentage = price_difference / last_price
+                    c.execute("SELECT * FROM products WHERE product_id = ?", (product_id, ))
+                    products = c.fetchall()
+
+                    key = lambda x : datetime.datetime.strptime(x[0], "%Y-%m-%d %H:%M:%S.%f")
+                    older_product = min(products, key = key)
+                    current_product = max(products, key = key)
+
+                    first_price = older_product[3]
+                    current_price = current_product[3]
+                    current_date = current_product[0]
+
+                    url = current_product[4]
+
+                    if current_price == 0:
+                        print(f"[Debugging] Price of URL {url} is equal to zero")
+                        continue
+
+                    price_difference = first_price - current_price
+                    percentage = price_difference / first_price
                     percentage_str = str("%.2f" % (percentage * 100))
 
                     if percentage >= self.percentage:
+                        product_name = current_product[2]
+
                         print(f"[Bot] Price of \"{product_name}\" is {percentage_str}% off")
+
+                        seller = self.scraper.get_product_info(url)["seller"]
 
                         message = product_name + "\n\n" + \
                             "Satıcı: " + seller + "\n\n" + \
-                            str(last_price) + " TL >>>> " + \
+                            str(first_price) + " TL >>>> " + \
                             str(current_price) + f" TL - {percentage_str}%" + "\n\n" + \
                             url + "\n\n" + \
                             MAIN_URL + "ara?q=" + product_id
 
                         context.bot.send_message(
-                            chat_id = job.context, 
+                            chat_id = CHANNEL_ID, 
                             text = message
                         )
 
                         c.execute(
-                            "UPDATE products SET last_price = ? WHERE product_id = ?",
-                            (current_price, product_id)
+                            "DELETE FROM products WHERE product_id = ? AND date != ?",
+                            (product_id, current_date)
                         )
             
             conn.commit()
     
     def start_bot(self, update: Update, context: CallbackContext) -> None:
         """Message the user when the price is low"""
-        if len(self.jobs_running) == 2:
-            update.message.reply_text('Sorry, the price tracker is already running')
-            return
         
         if len(context.args) < 1:
             update.message.reply_text(
-                'Sorry, you need to pass the bot mode as an argument.\n' +
-                'e.g. /start warn or /start track 50%'
+                "Sorry, you need to pass the bot mode as an argument.\n" +
+                "e.g. /start warn/track/warn-track (20%)"
             )
             return
 
@@ -106,42 +133,45 @@ class Bot(object):
 
         if mode == "warn":
             self.mode = "warn"
+            self.scraper.mode = "warn"
 
-            update.message.reply_text('Starting products tracking...')
+            update.message.reply_text("Starting products tracking...")
             print("[Bot] Starting products tracking...")
 
-        elif mode == "track":
+        elif mode == "track" or mode == "warn-track":
             if len(context.args) != 2:
                 update.message.reply_text(
-                    'Sorry, you need to pass the percentage as an argument.\n' +
-                    'e.g. /start track 20%'
+                    "Sorry, you need to pass the percentage as an argument.\n" +
+                    "e.g. /start track/warn-track 20%"
                 )
                 return
-            
-            self.mode = "track"
 
             percentage = context.args[1].replace("%", "")
 
             try:
                 percentage = float(percentage)
             except ValueError:
-                update.message.reply_text('Sorry, your argument must be a percentage number')
+                update.message.reply_text("Sorry, your argument must be a percentage number")
                 return
 
             if percentage < 0 or percentage > 100:
-                update.message.reply_text('Sorry, the percentage must be between 0 and 100 percent')
+                update.message.reply_text("Sorry, the percentage must be between 0 and 100 percent")
                 return
+            
+            self.mode = mode
+            self.scraper.mode = mode
             
             self.percentage = percentage / 100
 
-            update.message.reply_text('Starting price tracking...')
+            update.message.reply_text("Starting price tracking...")
             print("[Bot] Starting price tracking...")
         
         else:
             update.message.reply_text(
-                'Sorry, you need to passa valid argument.\n' +
-                'Valid arguments: "track", "warn"'
+                "Sorry, you need to passa valid argument.\n" +
+                "Valid arguments: \"track\", \"warn\", \"warn-track\""
             )
+            return
 
         self.jobs_running.append(
             self.job.run_repeating(
@@ -163,13 +193,13 @@ class Bot(object):
     def stop_bot(self, update: Update, context: CallbackContext) -> None:
         """Stops tracking price loop"""
         if len(self.jobs_running) == 0:
-            update.message.reply_text('Bot is already stopped')
+            update.message.reply_text("Bot is already stopped")
         else:
             for job in self.jobs_running:
                 job.schedule_removal()
 
             self.jobs_running = []
-            update.message.reply_text('Stoping bot...')
+            update.message.reply_text("Stoping bot...")
             print("[Bot] Bot stoping when current cycle ends")
 
     def add_urls(self, update: Update, context: CallbackContext) -> None:
@@ -212,33 +242,6 @@ class Bot(object):
         print(f"[Bot] URL(s) successfuly removed from the database")
         update.message.reply_text(f"URL(s) successfuly removed")
 
-    def add_proxies(self, update: Update, context: CallbackContext) -> None:
-        if len(context.args) < 1:
-            update.message.reply_text(
-                "Sorry, you must pass the proxies as arguments\n" + 
-                "e.g. /addproxies <proxy1> <proxy2> <...>"
-            )
-            return
-
-        proxies = context.args
-
-        with sqlite3.connect(DATABASE) as conn:
-            c = conn.cursor()
-
-            for proxy in proxies:
-                c.execute("INSERT INTO proxies VALUES (?);", (proxy, ))
-
-        print(f"[Bot] Proxies successfuly added to the database")
-        update.message.reply_text(f"Proxies added successfuly")
-    
-    def clear_proxies(self, update: Update, context: CallbackContext) -> None:
-        with sqlite3.connect(DATABASE) as conn:
-            c = conn.cursor()
-            c.execute(f"DELETE FROM proxies;")
-
-        print(f"[Bot] Proxies table successfuly cleared")
-        update.message.reply_text(f"Proxies table successfuly cleared")
-
     def get_status(self, update: Update, context: CallbackContext) -> None:
         if len(self.jobs_running) == 0:
             status = "Stopped"
@@ -265,7 +268,7 @@ class Bot(object):
         
     def change_percentage(self, update: Update, context: CallbackContext) -> None:
         if len(self.jobs_running) == 0:
-            update.message.reply_text('Sorry, you need to start the tracker in order to change the price')
+            update.message.reply_text("Sorry, you need to start the tracker in order to change the price")
             return
 
         if len(context.args) != 1:
@@ -280,11 +283,11 @@ class Bot(object):
         try:
             percentage = float(percentage)
         except ValueError:
-            update.message.reply_text('Sorry, your argument must be a percentage number')
+            update.message.reply_text("Sorry, your argument must be a percentage number")
             return
 
         if percentage < 0 or percentage > 100:
-            update.message.reply_text('Sorry, the percentage must be between 0 and 100%')
+            update.message.reply_text("Sorry, the percentage must be between 0 and 100%")
             return
         
         percentage = percentage / 100
@@ -293,7 +296,7 @@ class Bot(object):
         self.percentage = percentage
 
         update.message.reply_text(
-            f'Successfuly changed percentage from {str(old_percentage * 100)}% to {str(percentage * 100)}%'
+            f"Successfuly changed percentage from {str(old_percentage * 100)}% to {str(percentage * 100)}%"
         )
     
     def help_command(self, update: Update, context: CallbackContext) -> None:
@@ -312,7 +315,7 @@ class Bot(object):
     def start(self):
         print("[Bot] Starting bot...")
 
-        updater = Updater("1549588597:AAHsFKTLD6glkm1EWPL_qWPkLgXnwEx01r8")
+        updater = Updater(API_KEY)
         self.job = updater.job_queue
 
         # Get the dispatcher to register handlers
@@ -324,9 +327,6 @@ class Bot(object):
 
         dispatcher.add_handler(CommandHandler("addurls", self.add_urls))
         dispatcher.add_handler(CommandHandler("removeurls", self.remove_urls))
-
-        dispatcher.add_handler(CommandHandler("addproxies", self.add_proxies))
-        dispatcher.add_handler(CommandHandler("clearproxies", self.clear_proxies))
 
         dispatcher.add_handler(CommandHandler("changepercentage", self.change_percentage))
 
