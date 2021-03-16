@@ -2,3 +2,4 @@ python-telegram-bot==13.3
 beautifulsoup4==4.9.3
 requests==2.25.1
 lxml==4.6.2
+mysql-connector-python==8.0.23

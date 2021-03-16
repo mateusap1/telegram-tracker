@@ -1,20 +1,19 @@
 import random
-import sqlite3
-import ast
+import sys
 import time
 import requests
 import concurrent.futures
 import lxml.html
 import datetime
 import configparser
-
-from bs4 import BeautifulSoup
+import mysql.connector
 
 config = configparser.ConfigParser()
 config.read("./config.ini")
 
 TIMEOUT = config.getfloat("DEFAULT", "timeout_requests")
 TIMEOUT_THREADS = config.getfloat("DEFAULT", "timeout_thread")
+EXPIRE_PRODUCTS = config.getfloat("DEFAULT", "expire_products")
 
 PROXY_ADDR = config.get("PROXY", "address")
 PROXY_PORT = config.get("PROXY", "port")
@@ -25,91 +24,46 @@ if not PROXY_ADDR.strip() == "" and not PROXY_PORT.strip() == "":
     if PROXY_USER.strip() == "" or PROXY_PASSWORD.strip() == "":
         PROXY = PROXY_ADDR + ":" + PROXY_PORT
     else:
-        PROXY = "http://" + PROXY_USER + ":" + PROXY_PASSWORD + "@" + PROXY_ADDR + ":" + PROXY_PORT + "/"
+        PROXY = "http://" + PROXY_USER + ":" + PROXY_PASSWORD + "@" + PROXY_ADDR + ":" + PROXY_PORT
 else:
     PROXY = None
 
-user_agent_list = [
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.1 Safari/605.1.15',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:77.0) Gecko/20100101 Firefox/77.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.97 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:77.0) Gecko/20100101 Firefox/77.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.97 Safari/537.36',
-]
+DB_HOST = config.get("DATABASE", "host")
+DB_USER = config.get("DATABASE", "user")
+DB_PASSWORD = config.get("DATABASE", "password")
 
 MAIN_URL = "http://www.hepsiburada.com/"
 INFINIT = 10 ** 6
 
+with open("./ua.txt", "r") as f:
+    user_agent_list = f.read().split("\n")
+
 
 class Scraper(object):
 
-    def __init__(self, database: str):
-        self.database = database
-
+    def __init__(self):
         self.mode = None
-        self.products = []
         self.new_products = []
-        self.queries = []
+        self.deleted = []
         self.url_rows = []
-    
-    def execute_queries(self):
-        with sqlite3.connect(self.database) as conn:
-            c = conn.cursor()
 
-            queries = self.queries.copy()
-            self.queries = []
+    def connect_db(self) -> None:
+        return mysql.connector.connect(
+            host = DB_HOST,
+            user = DB_USER,
+            password = DB_PASSWORD,
+            database = "telegram_tracker"
+        )
 
-            for query in queries:
-                c.execute(*query)
+    def save_db(self, db) -> None:
+        """Commit the changes to the database"""
 
-    def add_products(self) -> None:
-        """Adds product if it is not already in the table"""
-
-        with sqlite3.connect(self.database) as conn:
-            c = conn.cursor()
-
-            products = self.products.copy()
-            self.products = []
-
-            c.execute(f"SELECT product_id FROM products;")
-            old_products_ids = [row[0] for row in c.fetchall()]
-
-            c.execute("SELECT rowid FROM urls WHERE first_cycle = 1;")
-            first_ids = [row[0] for row in c.fetchall()]
-
-            for product in products:
-                date, product_id, product_name, price, product_url, url_id = product
-
-                if self.mode == "warn" or self.mode == "warn-track":
-                    if not (product_id in old_products_ids) and not (url_id in first_ids):
-                        info = self.get_product_info(product_url)
-                        if info is not None:
-                            seller = info["seller"]
-                            product = date, product_id, product_name, price, product_url, url_id
-
-                            if seller.lower() == "hepsiburada":
-                                self.new_products.append(product)
-                
-                c.execute(
-                    "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?);", (
-                    date,
-                    product_id, 
-                    product_name,
-                    price,
-                    product_url,
-                    url_id
-                ))
-
-                repetitions = old_products_ids.count(product_id) + 1
-                if repetitions >= 3:
-                    c.execute(
-                        "DELETE FROM products WHERE product_id = ? ORDER BY date ASC LIMIT ?", 
-                        (product_id, repetitions - 2)
-                    )
-            
-            conn.commit()
+        db.commit()
+        db.close()
 
     def get_product_info(self, url: str) -> dict:
+        """Returns the price and the seller name of a product based on the URL given"""
+
         if PROXY is not None:
             proxies = {
                 "http": PROXY,
@@ -155,11 +109,16 @@ class Scraper(object):
         }
 
     def url_scraping(self, row):
+        """Based on a given URL, adds the products data to the database of every page it can find"""
+
         url_id = row[0]
         url = row[1].replace("https", "http")
 
         try:
             start = time.time()
+
+            db = self.connect_db()
+            c = db.cursor()
 
             print(f"[Scraper] URL {url} is being scraped...")
 
@@ -198,6 +157,12 @@ class Scraper(object):
                 page_limit = 1
             else:
                 page_limit = int(pages_el[-1].text) # The number of different product pages
+            
+            c.execute(f"SELECT listing_id FROM products;")
+            old_listing_ids = [row[0] for row in c.fetchall()]
+
+            c.execute("SELECT rowid FROM urls WHERE cycle > 0;")
+            first_ids = [row[0] for row in c.fetchall()]
 
             for i in range(1, page_limit+1):
                 if (time.time() - start) > (TIMEOUT_THREADS * page_limit):
@@ -224,6 +189,12 @@ class Scraper(object):
                     print("[Debugging] ERROR -> Response is None")
                     continue
 
+                c.close()
+                self.save_db(db)
+
+                db = self.connect_db()
+                c = db.cursor()
+
                 # Get the product name
                 p_names = html.xpath("//h3[@class='product-title title']")
 
@@ -232,22 +203,44 @@ class Scraper(object):
 
                 for a_el, p_name in zip(a_els, p_names):
                     product_id = a_el.get("data-sku").lower()
+                    listing_id = a_el.get("data-listing_id").lower()
                     product_price = float(a_el.get("data-price").replace(",", "."))
                     product_url = MAIN_URL[:-1] + a_el.get("href")
                     product_name = p_name.get("title")
+                    date = str(datetime.datetime.now())
 
-                    self.products.append((
-                        str(datetime.datetime.now()),
-                        product_id, 
-                        product_name, 
-                        product_price, 
-                        product_url, 
-                        url_id
-                    ))
+                    c.execute(
+                        "INSERT INTO products VALUES (%s, %s, %s, %s, %s, %s, %s, %s);", (
+                            date + " |X| " + listing_id,
+                            date,
+                            listing_id, 
+                            product_id, 
+                            product_name, 
+                            product_price, 
+                            product_url, 
+                            url_id
+                        )
+                    )
+
+                    if not (listing_id in old_listing_ids) and not (url_id in first_ids):
+                        product = (
+                            date + " |X| " + listing_id,
+                            date,
+                            listing_id, 
+                            product_id, 
+                            product_name, 
+                            product_price, 
+                            product_url, 
+                            url_id
+                        )
+
+                        self.new_products.append(product)
             
-            self.queries.append(("UPDATE urls SET first_cycle = 0 WHERE rowid = ?", (url_id, )))
+            c.execute("UPDATE urls SET cycle = cycle + 1 WHERE rowid = %s;", (url_id, ))
+            c.close()
+            self.save_db(db)
                 
-            print(f"[Scraper] URL {url} was successfuly scraped")
+            print(f"[Scraper] URL {url} was successfully scraped")
 
         except Exception as e:
             print(f"[Debugging] Error while scraping URL {url} -> \"{e}\"")
@@ -259,7 +252,6 @@ class Scraper(object):
 
         if len(self.url_rows) == 0:
             return
-        
 
         if PROXY is not None:
             print(f"[Debugging] Scraping with proxy {PROXY}...")
@@ -269,21 +261,52 @@ class Scraper(object):
         with concurrent.futures.ThreadPoolExecutor() as executor:
             executor.map(self.url_scraping, self.url_rows)
 
+        self.delete_repeated()
+
         end = time.time()
-        print(f"[Scraper] Cycle completed successfuly in {end - start} seconds.")
+        print(f"[Scraper] Cycle completed successfully in {end - start} seconds")
+
+    def delete_repeated(self) -> None:
+        print("[Bot] Deleting repeated rows...")
+
+        try:
+            db = self.connect_db()
+            c = db.cursor()
+
+            deleted = self.deleted.copy()
+
+            if len(deleted) > 0:
+                marks = ", ".join(["%s" for _ in range(len(deleted))])
+                c.execute(f"DELETE FROM products WHERE rowid IN ({marks});", deleted)
+
+            self.deleted = []
+
+            time = str(datetime.datetime.now() - datetime.timedelta(minutes = EXPIRE_PRODUCTS))
+            c.execute("DELETE FROM products WHERE date < %s;", (time, ))
+
+            c.close()
+            self.save_db(db)
+
+            print("[Bot] Repeated rows deleted successfully")
+        except Exception as e:
+            print(f"[Debugging] Error while deleting repeated products -> {e}")
 
     def delete_urls(self, urls: list) -> None:
-        with sqlite3.connect(self.database) as conn:
-            c = conn.cursor()
+        db = self.connect_db()
+        c = db.cursor()
 
-            q_marks = ", ".join(["?" for _ in range(len(urls))])
-            c.execute(f"SELECT rowid FROM urls WHERE url IN ({q_marks})", urls)
-            url_ids = [row[0] for row in c.fetchall()]
+        if len(urls) == 0:
+            return
 
-            c.execute(f"DELETE FROM urls WHERE rowid IN ({q_marks});", url_ids)
-            c.execute(f"DELETE FROM products WHERE url_id IN ({q_marks});", url_ids)
+        q_marks = ", ".join(["%s" for _ in range(len(urls))])
+        c.execute(f"SELECT rowid FROM urls WHERE url IN ({q_marks});", urls)
+        url_ids = [row[0] for row in c.fetchall()]
 
-            conn.commit()
+        c.execute(f"DELETE FROM urls WHERE rowid IN ({q_marks});", url_ids)
+        c.execute(f"DELETE FROM products WHERE url_id IN ({q_marks});", url_ids)
+
+        c.close()
+        self.save_db(db)
 
     def clean_db(self) -> None:
         result = input("Are you sure you want to clean the database? (Y/n) ")
@@ -294,16 +317,17 @@ class Scraper(object):
             print("Database was not modified")
             return
 
-        with sqlite3.connect(self.database) as conn:
-            c = conn.cursor()
+        db = self.connect_db()
+        c = db.cursor()
 
-            c.execute(f"DELETE FROM urls;")
-            c.execute(f"DELETE FROM products;")
+        c.execute(f"DELETE FROM urls;")
+        c.execute(f"DELETE FROM products;")
 
-            conn.commit()
+        c.close()
+        self.save_db(db)
     
-        print("Database cleaned successfuly")
+        print("Database cleaned successfully")
 
 if __name__ == "__main__":
-    scraper = Scraper("./data/database.db")
+    scraper = Scraper()
     scraper.clean_db()

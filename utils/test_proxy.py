@@ -1,6 +1,9 @@
 import configparser
 import requests
 import json
+import logging
+
+logging.captureWarnings(True)
 
 config = configparser.ConfigParser()
 config.read("./config.ini")
@@ -14,14 +17,16 @@ if not PROXY_ADDR.strip() == "" and not PROXY_PORT.strip() == "":
     if PROXY_USER.strip() == "" or PROXY_PASSWORD.strip() == "":
         PROXY = PROXY_ADDR + ":" + PROXY_PORT
     else:
-        PROXY = "http://" + PROXY_USER + ":" + PROXY_PASSWORD + "@" + PROXY_ADDR + ":" + PROXY_PORT + "/"
+        PROXY = "http://" + PROXY_USER + ":" + PROXY_PASSWORD + "@" + PROXY_ADDR + ":" + PROXY_PORT
 else:
     PROXY = None
 
-TIMEOUT = 5
+TIMEOUT = 50
+
+print(PROXY)
 
 def my_ip():
-    r = requests.get("http://httpbin.org/ip", timeout=TIMEOUT)
+    r = requests.get("https://httpbin.org/ip", timeout=TIMEOUT)
 
     return r.json()["origin"]
 
@@ -39,7 +44,7 @@ def test_proxy():
     ip = my_ip()
 
     try:
-        r = requests.get("https://httpbin.org/ip", timeout=TIMEOUT, proxies=proxies)
+        r = requests.get("https://httpbin.org/ip", timeout=TIMEOUT, proxies=proxies, verify=False)
     except requests.RequestException as e:
         print("Proxy didn't respond")
         print(f"Error {e}")
@@ -48,11 +53,12 @@ def test_proxy():
     if r.status_code == 200:
         try:
             if r.json()["origin"] != ip:
-                url = "https://www.hepsiburada.com/elbiseler-c-12087202"
+                url = "https://www.hepsiburada.com/elbiseler-c-12087202/"
                 try:
-                    r = requests.get(url, timeout=TIMEOUT, verify=False, proxies=proxies, headers=headers)
+                    r = requests.get(url, timeout=TIMEOUT, proxies=proxies, headers=headers, verify=False)
                 except requests.RequestException as e:
                     print("Proxy didn't worked when trying to access the website")
+                    print(e)
                     return False
                 
                 if r.status_code == 200:
@@ -60,6 +66,7 @@ def test_proxy():
                     return True
                 else:
                     print("Proxy works, but is being blocked by the website")
+                    print(status_code)
         except json.decoder.JSONDecodeError:
             print("An error occured when trying to make a request")
             return False

@@ -3,10 +3,12 @@ from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
 import telegram
-import sqlite3
+import mysql.connector
 import datetime
 import configparser
 import builtins
+import sys
+import re
 
 
 config = configparser.ConfigParser()
@@ -16,42 +18,73 @@ CHANNEL_ID = config.get("DEFAULT", "channel_id")
 API_KEY = config.get("DEFAULT", "bot_key")
 DELAY = config.getfloat("DEFAULT", "cycle_delay")
 MAIN_URL = 'http://www.hepsiburada.com/'
-DATABASE = "./data/database.db"
+
+
+if CHANNEL_ID.strip() == "":
+    print("[Error] You must enter a channel ID")
+    sys.exit(1)
+elif API_KEY.strip() == "":
+    print("[Error] You must enter an API key")
+    sys.exit(1)
+
+DB_HOST = config.get("DATABASE", "host")
+DB_USER = config.get("DATABASE", "user")
+DB_PASSWORD = config.get("DATABASE", "password")
 
 
 class Bot(object):
 
     def __init__(self):
-        self.scraper = Scraper(DATABASE)
+        self.scraper = Scraper()
         self.jobs_running = []
         self.percentage = 0
         self.delay = DELAY
         self.mode = None
 
+    def connect_db(self) -> None:
+        return mysql.connector.connect(
+            host = DB_HOST,
+            user = DB_USER,
+            password = DB_PASSWORD,
+            database = "telegram_tracker"
+        )
+
+    def save_db(self, db) -> None:
+        db.commit()
+        db.close()
+
     def compare_prices(self, context: CallbackContext) -> None:
         """Check the database to see if any product is with a low price"""
 
-        job = context.job
-        
-        if len(self.scraper.products) > 0:
-            self.scraper.add_products()
-            print("[Bot] Products added successfuly")
-        
-        if len(self.scraper.queries) > 0:
-            self.scraper.execute_queries()
-        
-        with sqlite3.connect(DATABASE) as conn:
-            c = conn.cursor()
+        try:
+            job = context.job
 
-            c.execute("SELECT rowid, * FROM urls;")
+            db = self.connect_db()
+            c = db.cursor()
+
+            print("[Bot] Comparing prices...")
+
+            c.execute("SELECT * FROM urls;")
             self.scraper.url_rows = c.fetchall()
+
+            new_products = self.scraper.new_products.copy()
+            self.scraper.new_products = []
         
             if self.mode == "warn" or self.mode == "warn-track":
-                new_products = self.scraper.new_products.copy()
-                self.scraper.new_products = []
-
                 for product in new_products:
-                    date, product_id, product_name, product_price, product_url, url_id = product
+                    rowid, date, product_id, listing_id, product_name, \
+                        product_price, product_url, url_id = product
+                    
+                    seller = re.match(r"\?magaza=(.*)$", product_url)
+
+                    if not seller:
+                        info = self.scraper.get_product_info(product_url)
+                        seller = info["seller"]
+                    else:
+                        seller = seller[0]
+
+                    if seller.lower() != "hepsiburada":
+                        continue
 
                     message = product_name + "\n\n" + \
                         str(product_price) + " TL\n\n" + \
@@ -63,27 +96,82 @@ class Bot(object):
                     )
 
             if self.mode == "track" or self.mode == "warn-track":
-                c.execute("SELECT DISTINCT product_id FROM products")
+                c.execute("""SELECT DISTINCT p.product_id  
+                             FROM products p 
+                             WHERE EXISTS (SELECT 1 
+                                           FROM products l 
+                                           WHERE p.product_id = l.product_id AND p.price <> l.price
+                                           );
+                """)
                 prod_rows = c.fetchall()
 
+                deleted = self.scraper.deleted.copy()
+                marks = ", ".join(["%s" for _ in range(len(deleted))])
                 for row in prod_rows:
-                    product_id = row[0]
-                    
                     if len(self.jobs_running) == 0:
                         return
 
-                    c.execute("SELECT * FROM products WHERE product_id = ?", (product_id, ))
-                    products = c.fetchall()
+                    product_id = row[0]
 
-                    key = lambda x : datetime.datetime.strptime(x[0], "%Y-%m-%d %H:%M:%S.%f")
-                    older_product = min(products, key = key)
-                    current_product = max(products, key = key)
+                    c.execute(
+                        "SELECT DISTINCT listing_id FROM products WHERE product_id = %s;",
+                        (product_id, )
+                    )
+                    listing_ids = [row[0] for row in c.fetchall()]
 
-                    first_price = older_product[3]
-                    current_price = current_product[3]
-                    current_date = current_product[0]
+                    histories = []
 
-                    url = current_product[4]
+                    # Keep track of the products with different listing_ids
+                    for listing_id in listing_ids:
+                        if len(deleted) > 0:
+                            c.execute(
+                                "SELECT * FROM products WHERE listing_id = %s " + \
+                                    f"AND rowid NOT IN ({marks}) ORDER BY date DESC;",
+                                (listing_id, *deleted)
+                            )
+                        else:
+                            c.execute(
+                                "SELECT * FROM products WHERE listing_id = %s ORDER BY date DESC;",
+                                (listing_id, )
+                            )
+
+                        products = c.fetchall()
+                        if len(products) > 0:
+                            histories.append(products)
+
+                    if len(histories) == 0:
+                        continue
+                    
+                    key = lambda x : x[5]
+
+                    iterable = [products[0] for products in histories]
+
+                    if len(iterable) == 0:
+                        continue
+
+                    # Get the product with the lower price from the first elements of each list
+                    current_product = min(iterable, key = key)
+
+                    iterable = []
+                    for products in histories:
+                        if len(products) == 0:
+                            continue
+
+                        if not products[-1] in new_products:
+                            iterable.append(products[-1])
+                        
+                    if len(iterable) == 0:
+                        continue
+
+                    # From the list that has the longest lenght 
+                    # get the product with the lower price
+                    older_product = min(iterable, key = key)
+
+                    first_price = older_product[5]
+                    current_price = current_product[5]
+                    current_date = current_product[1]
+
+                    url = current_product[6]
 
                     if current_price == 0:
                         print(f"[Debugging] Price of URL {url} is equal to zero")
@@ -94,11 +182,19 @@ class Bot(object):
                     percentage_str = str("%.2f" % (percentage * 100))
 
                     if percentage >= self.percentage:
-                        product_name = current_product[2]
+                        rowid = current_product[0]
+                        product_name = current_product[4]
+                        product_id = current_product[3]
 
                         print(f"[Bot] Price of \"{product_name}\" is {percentage_str}% off")
 
-                        seller = self.scraper.get_product_info(url)["seller"]
+                        seller = re.match(r"\?magaza=(.*)$", url)
+
+                        if not seller:
+                            info = self.scraper.get_product_info(url)
+                            seller = info["seller"]
+                        else:
+                            seller = seller[0]
 
                         message = product_name + "\n\n" + \
                             "Satıcı: " + seller + "\n\n" + \
@@ -113,11 +209,19 @@ class Bot(object):
                         )
 
                         c.execute(
-                            "DELETE FROM products WHERE product_id = ? AND date != ?",
-                            (product_id, current_date)
+                            "SELECT rowid FROM products WHERE product_id = %s AND rowid != %s;",
+                            (product_id, rowid)
                         )
-            
-            conn.commit()
+
+                        rowids = [row[0] for row in c.fetchall()]
+                        self.scraper.deleted += rowids
+
+            c.close()
+            self.save_db(db)
+
+            print("[Bot] Prices compared successfuly")
+        except Exception as e:
+            print(f"[Debugging] Error while comparing prices -> {e}")
     
     def start_bot(self, update: Update, context: CallbackContext) -> None:
         """Message the user when the price is low"""
@@ -175,18 +279,18 @@ class Bot(object):
 
         self.jobs_running.append(
             self.job.run_repeating(
-                self.scraper.get_products,
+                self.compare_prices,
                 interval = self.delay,
-                first = 5
+                first = 5,
+                context = update.message.chat_id
             )
         )
 
         self.jobs_running.append(
             self.job.run_repeating(
-                self.compare_prices,
+                self.scraper.get_products,
                 interval = self.delay,
-                first = 5,
-                context = update.message.chat_id
+                first = 5
             )
         )
     
@@ -205,25 +309,29 @@ class Bot(object):
     def add_urls(self, update: Update, context: CallbackContext) -> None:
         """Adds an url to the database"""
 
-        with sqlite3.connect(DATABASE) as conn:
-            c = conn.cursor()
+        if len(context.args) < 1:
+            update.message.reply_text(
+                "Sorry, you must pass the URLs as arguments\n" + 
+                "e.g. /addurls <URL1> <URL2> <...>"
+            )
+            return
 
-            if len(context.args) < 1:
-                update.message.reply_text(
-                    "Sorry, you must pass the URLs as arguments\n" + 
-                    "e.g. /addurls <URL1> <URL2> <...>"
-                )
-                return
+        urls = context.args
 
-            urls = context.args
+        db = self.connect_db()
+        c = db.cursor()
 
-            for url in urls:
-                c.execute("INSERT INTO urls VALUES (?, ?);", (url, 1))
+        c.execute("SELECT COUNT(rowid) FROM urls;")
+        size = int(c.fetchone()[0])
 
-            conn.commit()
+        for i, url in enumerate(urls):
+            c.execute("INSERT INTO urls VALUES (%s, %s, %s);", (i+size, url, 1))
 
-            print(f"[Bot] URL(s) successfuly added to the database")
-            update.message.reply_text("URL(s) added successfuly")
+        c.close()
+        self.save_db(db)
+
+        print(f"[Bot] URL(s) successfuly added to the database")
+        update.message.reply_text("URL(s) added successfuly")
     
     def remove_urls(self, update: Update, context: CallbackContext) -> None:
         """Removes an url from the database"""
@@ -243,28 +351,31 @@ class Bot(object):
         update.message.reply_text(f"URL(s) successfuly removed")
 
     def get_status(self, update: Update, context: CallbackContext) -> None:
+        db = self.connect_db()
+        c = db.cursor()
+
         if len(self.jobs_running) == 0:
             status = "Stopped"
         else:
             status = "Running"
 
         percentage = str(self.percentage * 100) + "%"
+        
+        c.execute("SELECT * from urls;")
 
-        with sqlite3.connect(DATABASE) as conn:
-            c = conn.cursor()
-            
-            c.execute("SELECT * from urls;")
-            urls = [row[0] for row in c.fetchall()]
-            if len(urls) == 0:
-                urls_str = " Empty\n"
-            else:
-                urls_str = "\n - " + "\n - ".join(urls) + "\n"
+        urls = [row[1] for row in c.fetchall()]
+        if len(urls) == 0:
+            urls_str = " Empty\n"
+        else:
+            urls_str = "\n - " + "\n - ".join(urls) + "\n"
         
         update.message.reply_text(
             f"Tracker Status: {status}\n" +
             f"Current Percentage: {percentage}\n" +
             "URLs:" + urls_str
         )
+
+        c.close()
         
     def change_percentage(self, update: Update, context: CallbackContext) -> None:
         if len(self.jobs_running) == 0:
