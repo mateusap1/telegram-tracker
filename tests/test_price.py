@@ -20,22 +20,24 @@ db = mysql.connector.connect(
 c = db.cursor()
 
 prices = [
-    [3000, 2700, 2200],
-    [None, 2800, 2000],
-    [3700, 3300, 3000]
+    [2279, 2279, 2279, 2279, 2279],
+    [None, None, None, 1519, 1519],
+    [None, None, None, None, None]
 ]
+# prices = [
+#     [171.91, 171.91, 171.91, 171.91],
+#     [79.9, 79.9, 79.9, 79.9],
+#     [None, None, None, None]
+# ]
 
 # product_id = "<product_id>" + str(random.randint(1, 1000))
 product_id = "<product_id>"
-product_name = 'Lenovo V14 Ill Intel Core i5 1035G1 8GB 1TB + 256GB SSD Windows 10 Home 14" FHD Taşınabilir Bilgisayar 82C400A8TXR3'
+product_name = 'Teste'
 product_url = "https://www.hepsiburada.com/lenovo-v14-ill-intel-core-i5-1035g1-8gb-1tb-256gb-ssd-windows-10-home-14-fhd-tasinabilir-bilgisayar-82c400a8txr3-p-HBV00001C8DV3?magaza=Bisistem"
 url_id = 1
 
-
-date = "2021-03-16 16:09:29.421038"
+date = str(datetime.datetime.now())
 for price1, price2, price3 in zip(*prices):
-    # date = str(datetime.datetime.now())
-
     if price1 is not None:
         c.execute(
             "INSERT INTO products VALUES (%s, %s, %s, %s, %s, %s, %s, %s);", (
@@ -78,7 +80,7 @@ for price1, price2, price3 in zip(*prices):
             )
         )
     
-    date = str(datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S.%f") + datetime.timedelta(minutes = 1))
+    date = str(datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S.%f") + datetime.timedelta(seconds = 120))
 
 c.close()
 db.commit()

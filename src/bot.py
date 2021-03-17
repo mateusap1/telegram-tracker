@@ -9,7 +9,7 @@ import configparser
 import builtins
 import sys
 import re
-
+import time
 
 config = configparser.ConfigParser()
 config.read("./config.ini")
@@ -17,8 +17,8 @@ config.read("./config.ini")
 CHANNEL_ID = config.get("DEFAULT", "channel_id")
 API_KEY = config.get("DEFAULT", "bot_key")
 DELAY = config.getfloat("DEFAULT", "cycle_delay")
+OLDER_PRODUCTS_RANGE = config.getfloat("DEFAULT", "older_products_range")
 MAIN_URL = 'http://www.hepsiburada.com/'
-
 
 if CHANNEL_ID.strip() == "":
     print("[Error] You must enter a channel ID")
@@ -30,7 +30,6 @@ elif API_KEY.strip() == "":
 DB_HOST = config.get("DATABASE", "host")
 DB_USER = config.get("DATABASE", "user")
 DB_PASSWORD = config.get("DATABASE", "password")
-
 
 class Bot(object):
 
@@ -62,8 +61,6 @@ class Bot(object):
             db = self.connect_db()
             c = db.cursor()
 
-            print("[Bot] Comparing prices...")
-
             c.execute("SELECT * FROM urls;")
             self.scraper.url_rows = c.fetchall()
 
@@ -71,6 +68,8 @@ class Bot(object):
             self.scraper.new_products = []
         
             if self.mode == "warn" or self.mode == "warn-track":
+                print("[Bot] Searching for new products...")
+
                 for product in new_products:
                     rowid, date, product_id, listing_id, product_name, \
                         product_price, product_url, url_id = product
@@ -80,22 +79,28 @@ class Bot(object):
                     if not seller:
                         info = self.scraper.get_product_info(product_url)
                         seller = info["seller"]
+                        product_url += "\n\n"
+
                     else:
                         seller = seller[0]
+                        product_url += "?magaza=Hepsiburada\n\n"
 
                     if seller.lower() != "hepsiburada":
                         continue
 
                     message = product_name + "\n\n" + \
                         str(product_price) + " TL\n\n" + \
-                        product_url + "?magaza=Hepsiburada\n\n"
+                        product_url
 
                     context.bot.send_message(
                         chat_id = CHANNEL_ID, 
                         text = message
                     )
+                
+                print("[Bot] Products were searched successfully")
 
             if self.mode == "track" or self.mode == "warn-track":
+                print("[Bot] Comparing prices...")
                 c.execute("""SELECT DISTINCT p.product_id  
                              FROM products p 
                              WHERE EXISTS (SELECT 1 
@@ -113,59 +118,39 @@ class Bot(object):
 
                     product_id = row[0]
 
-                    c.execute(
-                        "SELECT DISTINCT listing_id FROM products WHERE product_id = %s;",
-                        (product_id, )
-                    )
-                    listing_ids = [row[0] for row in c.fetchall()]
+                    if len(deleted) > 0:
+                        c.execute(
+                            f"SELECT * FROM products WHERE product_id = %s AND rowid NOT IN ({marks}) ORDER BY date DESC;",
+                            (product_id, *deleted)
+                        )
+                    else:
+                        c.execute(
+                            f"SELECT * FROM products WHERE product_id = %s ORDER BY date DESC;",
+                            (product_id, *deleted)
+                        )
+                    products = c.fetchall()
 
-                    histories = []
+                    old_products = products.copy()
+                    new_products = []
+                    limit = datetime.datetime.strptime(products[-1][1], "%Y-%m-%d %H:%M:%S.%f") + \
+                         datetime.timedelta(minutes = OLDER_PRODUCTS_RANGE)
 
-                    # Keep track of the products with different listing_ids
-                    for listing_id in listing_ids:
-                        if len(deleted) > 0:
-                            c.execute(
-                                "SELECT * FROM products WHERE listing_id = %s " + \
-                                    f"AND rowid NOT IN ({marks}) ORDER BY date DESC;",
-                                (listing_id, *deleted)
-                            )
-                        else:
-                            c.execute(
-                                "SELECT * FROM products WHERE listing_id = %s ORDER BY date DESC;",
-                                (listing_id, )
-                            )
+                    for i, product in enumerate(products[::-1]):
+                        date = datetime.datetime.strptime(product[1], "%Y-%m-%d %H:%M:%S.%f")
 
-                        products = c.fetchall()
-                        if len(products) > 0:
-                            histories.append(products)
-
-                    if len(histories) == 0:
-                        continue
+                        index = len(products) - i - 1
+                        if date > limit:
+                            old_products = products[index+1:]
+                            new_products = products[:index+1]
+                            break
                     
-                    key = lambda x : x[5]
-
-                    iterable = [products[0] for products in histories]
-
-                    if len(iterable) == 0:
+                    if len(new_products) == 0:
                         continue
-
-                    # Get the product with the lower price from the first elements of each list
-                    current_product = min(iterable, key = key)
-
-                    iterable = []
-                    for products in histories:
-                        if len(products) == 0:
-                            continue
-
-                        if not products[-1] in new_products:
-                            iterable.append(products[-1])
+                    if len(old_products) == 0:
+                        continue
                         
-                    if len(iterable) == 0:
-                        continue
-
-                    # From the list that has the longest lenght 
-                    # get the product with the lower price
-                    older_product = min(iterable, key = key)
+                    older_product = min(old_products, key=lambda x : x[5])
+                    current_product = min(new_products, key=lambda x : x[5])
 
                     first_price = older_product[5]
                     current_price = current_product[5]
@@ -216,10 +201,11 @@ class Bot(object):
                         rowids = [row[0] for row in c.fetchall()]
                         self.scraper.deleted += rowids
 
+                print("[Bot] Prices compared successfuly")
+
             c.close()
             self.save_db(db)
 
-            print("[Bot] Prices compared successfuly")
         except Exception as e:
             print(f"[Debugging] Error while comparing prices -> {e}")
     
