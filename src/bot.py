@@ -8,6 +8,7 @@ import datetime
 import configparser
 import builtins
 import sys
+import os
 import re
 import time
 
@@ -16,8 +17,9 @@ config.read("./config.ini")
 
 CHANNEL_ID = config.get("DEFAULT", "channel_id")
 API_KEY = config.get("DEFAULT", "bot_key")
-DELAY = config.getfloat("DEFAULT", "cycle_delay")
-OLDER_PRODUCTS_RANGE = config.getfloat("DEFAULT", "older_products_range")
+
+DELAY = config.getfloat("TIME", "cycle_delay")
+OLDER_PRODUCTS_RANGE = config.getfloat("TIME", "older_products_range")
 MAIN_URL = 'http://www.hepsiburada.com/'
 
 if CHANNEL_ID.strip() == "":
@@ -27,9 +29,16 @@ elif API_KEY.strip() == "":
     print("[Error] You must enter an API key")
     sys.exit(1)
 
+if CHANNEL_ID[0] == "$":
+    CHANNEL_ID = os.getenv(CHANNEL_ID[1:])
+if API_KEY[0] == "$":
+    API_KEY = os.getenv(API_KEY[1:])
+
 DB_HOST = config.get("DATABASE", "host")
 DB_USER = config.get("DATABASE", "user")
 DB_PASSWORD = config.get("DATABASE", "password")
+DB_NAME = "telegram_tracker"
+
 
 class Bot(object):
 
@@ -41,39 +50,45 @@ class Bot(object):
         self.mode = None
 
     def connect_db(self) -> None:
+        """Starts a connection to the database""""
+
         return mysql.connector.connect(
-            host = DB_HOST,
-            user = DB_USER,
-            password = DB_PASSWORD,
-            database = "telegram_tracker"
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME
         )
 
     def save_db(self, db) -> None:
+        """Commits and save everything from the database"""
+
         db.commit()
         db.close()
 
     def compare_prices(self, context: CallbackContext) -> None:
         """Check the database to see if any product is with a low price"""
 
+        db = self.connect_db()
+        c = db.cursor()
+
         try:
             job = context.job
-
-            db = self.connect_db()
-            c = db.cursor()
 
             c.execute("SELECT * FROM urls;")
             self.scraper.url_rows = c.fetchall()
 
             new_products = self.scraper.new_products.copy()
             self.scraper.new_products = []
-        
+
             if self.mode == "warn" or self.mode == "warn-track":
                 print("[Bot] Searching for new products...")
 
+                # For each product added to the `new_products` list, verify if they are from
+                # seller "Hepsiburada". If they are, warn the user.
                 for product in new_products:
                     rowid, date, product_id, listing_id, product_name, \
                         product_price, product_url, url_id = product
-                    
+
                     seller = re.match(r"\?magaza=(.*)$", product_url)
 
                     if not seller:
@@ -93,10 +108,10 @@ class Bot(object):
                         product_url
 
                     context.bot.send_message(
-                        chat_id = CHANNEL_ID, 
-                        text = message
+                        chat_id=CHANNEL_ID,
+                        text=message
                     )
-                
+
                 print("[Bot] Products were searched successfully")
 
             if self.mode == "track" or self.mode == "warn-track":
@@ -118,6 +133,7 @@ class Bot(object):
 
                     product_id = row[0]
 
+                    # Get all products from this id that weren't deleted yet
                     if len(deleted) > 0:
                         c.execute(
                             f"SELECT * FROM products WHERE product_id = %s AND rowid NOT IN ({marks}) ORDER BY date DESC;",
@@ -132,25 +148,30 @@ class Bot(object):
 
                     old_products = products.copy()
                     new_products = []
-                    limit = datetime.datetime.strptime(products[-1][1], "%Y-%m-%d %H:%M:%S.%f") + \
-                         datetime.timedelta(minutes = OLDER_PRODUCTS_RANGE)
 
+                    # The max_date a product can have in order to be considered "old"
+                    limit = datetime.datetime.strptime(products[-1][1], "%Y-%m-%d %H:%M:%S.%f") + \
+                        datetime.timedelta(minutes=OLDER_PRODUCTS_RANGE)
+
+                    # Separate "old" from "new" products
                     for i, product in enumerate(products[::-1]):
-                        date = datetime.datetime.strptime(product[1], "%Y-%m-%d %H:%M:%S.%f")
+                        date = datetime.datetime.strptime(
+                            product[1], "%Y-%m-%d %H:%M:%S.%f")
 
                         index = len(products) - i - 1
                         if date > limit:
                             old_products = products[index+1:]
                             new_products = products[:index+1]
                             break
-                    
+
+                    # If we have only one or even none of the lists, return
                     if len(new_products) == 0:
                         continue
                     if len(old_products) == 0:
                         continue
-                        
-                    older_product = min(old_products, key=lambda x : x[5])
-                    current_product = min(new_products, key=lambda x : x[5])
+
+                    older_product = min(old_products, key=lambda x: x[5])
+                    current_product = min(new_products, key=lambda x: x[5])
 
                     first_price = older_product[5]
                     current_price = current_product[5]
@@ -158,23 +179,23 @@ class Bot(object):
 
                     url = current_product[6]
 
-                    if current_price == 0:
-                        print(f"[Debugging] Price of URL {url} is equal to zero")
-                        continue
-
                     price_difference = first_price - current_price
                     percentage = price_difference / first_price
                     percentage_str = str("%.2f" % (percentage * 100))
 
+                    # If the drop in the price was greater then the expected percentage, warn the user
                     if percentage >= self.percentage:
                         rowid = current_product[0]
                         product_name = current_product[4]
                         product_id = current_product[3]
 
-                        print(f"[Bot] Price of \"{product_name}\" is {percentage_str}% off")
+                        print(
+                            f"[Bot] Price of \"{product_name}\" is {percentage_str}% off")
 
+                        # If we can get the sellers name in the URL, store it
                         seller = re.match(r"\?magaza=(.*)$", url)
 
+                        # If the seller isn't in the URL, get it from the product page
                         if not seller:
                             info = self.scraper.get_product_info(url)
                             seller = info["seller"]
@@ -189,8 +210,8 @@ class Bot(object):
                             MAIN_URL + "ara?q=" + product_id
 
                         context.bot.send_message(
-                            chat_id = CHANNEL_ID, 
-                            text = message
+                            chat_id=CHANNEL_ID,
+                            text=message
                         )
 
                         c.execute(
@@ -198,6 +219,7 @@ class Bot(object):
                             (product_id, rowid)
                         )
 
+                        # Delete every product with this id with the exception of the last one
                         rowids = [row[0] for row in c.fetchall()]
                         self.scraper.deleted += rowids
 
@@ -207,11 +229,14 @@ class Bot(object):
             self.save_db(db)
 
         except Exception as e:
+            c.close()
+            self.save_db(db)
+
             print(f"[Debugging] Error while comparing prices -> {e}")
-    
+
     def start_bot(self, update: Update, context: CallbackContext) -> None:
         """Message the user when the price is low"""
-        
+
         if len(context.args) < 1:
             update.message.reply_text(
                 "Sorry, you need to pass the bot mode as an argument.\n" +
@@ -241,21 +266,23 @@ class Bot(object):
             try:
                 percentage = float(percentage)
             except ValueError:
-                update.message.reply_text("Sorry, your argument must be a percentage number")
+                update.message.reply_text(
+                    "Sorry, your argument must be a percentage number")
                 return
 
             if percentage < 0 or percentage > 100:
-                update.message.reply_text("Sorry, the percentage must be between 0 and 100 percent")
+                update.message.reply_text(
+                    "Sorry, the percentage must be between 0 and 100 percent")
                 return
-            
+
             self.mode = mode
             self.scraper.mode = mode
-            
+
             self.percentage = percentage / 100
 
             update.message.reply_text("Starting price tracking...")
             print("[Bot] Starting price tracking...")
-        
+
         else:
             update.message.reply_text(
                 "Sorry, you need to passa valid argument.\n" +
@@ -266,20 +293,20 @@ class Bot(object):
         self.jobs_running.append(
             self.job.run_repeating(
                 self.compare_prices,
-                interval = self.delay,
-                first = 5,
-                context = update.message.chat_id
+                interval=self.delay,
+                first=5,
+                context=update.message.chat_id
             )
         )
 
         self.jobs_running.append(
             self.job.run_repeating(
                 self.scraper.get_products,
-                interval = self.delay,
-                first = 5
+                interval=self.delay,
+                first=5
             )
         )
-    
+
     def stop_bot(self, update: Update, context: CallbackContext) -> None:
         """Stops tracking price loop"""
         if len(self.jobs_running) == 0:
@@ -297,7 +324,7 @@ class Bot(object):
 
         if len(context.args) < 1:
             update.message.reply_text(
-                "Sorry, you must pass the URLs as arguments\n" + 
+                "Sorry, you must pass the URLs as arguments\n" +
                 "e.g. /addurls <URL1> <URL2> <...>"
             )
             return
@@ -311,20 +338,21 @@ class Bot(object):
         size = int(c.fetchone()[0])
 
         for i, url in enumerate(urls):
-            c.execute("INSERT INTO urls VALUES (%s, %s, %s);", (i+size, url, 1))
+            c.execute("INSERT INTO urls VALUES (%s, %s, %s);",
+                      (i+size, url, 1))
 
         c.close()
         self.save_db(db)
 
         print(f"[Bot] URL(s) successfuly added to the database")
         update.message.reply_text("URL(s) added successfuly")
-    
+
     def remove_urls(self, update: Update, context: CallbackContext) -> None:
         """Removes an url from the database"""
 
         if len(context.args) < 1:
             update.message.reply_text(
-                "Sorry, you must pass the URLs as arguments\n" + 
+                "Sorry, you must pass the URLs as arguments\n" +
                 "e.g. /removeurls <URL1> <URL2> <...>"
             )
             return
@@ -346,7 +374,7 @@ class Bot(object):
             status = "Running"
 
         percentage = str(self.percentage * 100) + "%"
-        
+
         c.execute("SELECT * from urls;")
 
         urls = [row[1] for row in c.fetchall()]
@@ -354,7 +382,7 @@ class Bot(object):
             urls_str = " Empty\n"
         else:
             urls_str = "\n - " + "\n - ".join(urls) + "\n"
-        
+
         update.message.reply_text(
             f"Tracker Status: {status}\n" +
             f"Current Percentage: {percentage}\n" +
@@ -362,15 +390,16 @@ class Bot(object):
         )
 
         c.close()
-        
+
     def change_percentage(self, update: Update, context: CallbackContext) -> None:
         if len(self.jobs_running) == 0:
-            update.message.reply_text("Sorry, you need to start the tracker in order to change the price")
+            update.message.reply_text(
+                "Sorry, you need to start the tracker in order to change the price")
             return
 
         if len(context.args) != 1:
             update.message.reply_text(
-                "Sorry, you must pass the percentage as an argument\n" + 
+                "Sorry, you must pass the percentage as an argument\n" +
                 "e.g. /changepercentage 30%"
             )
             return
@@ -380,22 +409,24 @@ class Bot(object):
         try:
             percentage = float(percentage)
         except ValueError:
-            update.message.reply_text("Sorry, your argument must be a percentage number")
+            update.message.reply_text(
+                "Sorry, your argument must be a percentage number")
             return
 
         if percentage < 0 or percentage > 100:
-            update.message.reply_text("Sorry, the percentage must be between 0 and 100%")
+            update.message.reply_text(
+                "Sorry, the percentage must be between 0 and 100%")
             return
-        
+
         percentage = percentage / 100
-        
+
         old_percentage = self.percentage
         self.percentage = percentage
 
         update.message.reply_text(
             f"Successfuly changed percentage from {str(old_percentage * 100)}% to {str(percentage * 100)}%"
         )
-    
+
     def help_command(self, update: Update, context: CallbackContext) -> None:
         """Send a message when the command /help is issued."""
         update.message.reply_text(
@@ -408,7 +439,7 @@ class Bot(object):
             "/changepercentage <new percentage>: changes the percentage to a new value\n" +
             "/status: messages the bot status"
         )
-    
+
     def start(self):
         print("[Bot] Starting bot...")
 
@@ -425,7 +456,8 @@ class Bot(object):
         dispatcher.add_handler(CommandHandler("addurls", self.add_urls))
         dispatcher.add_handler(CommandHandler("removeurls", self.remove_urls))
 
-        dispatcher.add_handler(CommandHandler("changepercentage", self.change_percentage))
+        dispatcher.add_handler(CommandHandler(
+            "changepercentage", self.change_percentage))
 
         dispatcher.add_handler(CommandHandler("status", self.get_status))
         dispatcher.add_handler(CommandHandler("help", self.help_command))
