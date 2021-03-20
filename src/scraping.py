@@ -1,6 +1,8 @@
 import random
+import math
 import sys
 import time
+import json
 import requests
 import concurrent.futures
 import lxml.html
@@ -11,7 +13,13 @@ import mysql.connector
 config = configparser.ConfigParser()
 config.read("./config.ini")
 
-max_threads = config.getint("DEFAULT", "threads")
+MAX_THREADS = config.getint("DEFAULT", "threads")
+BOT_MODE = config.get("DEFAULT", "mode").lower()
+
+if not BOT_MODE in ("scrape", "compare", "scrape-compare"):
+    print("[Error] You must provide a valid mode")
+    print("Valid modes: \"scrape\", \"compare\" and \"scrape-compare\"")
+    sys.exit(1)
 
 TIMEOUT = config.getfloat("TIME", "timeout_requests")
 TIMEOUT_THREADS = config.getfloat("TIME", "timeout_thread")
@@ -48,7 +56,6 @@ class Scraper(object):
     def __init__(self):
         self.mode = None
         self.new_products = []
-        self.deleted = []
         self.url_rows = []
 
     def connect_db(self) -> None:
@@ -78,7 +85,7 @@ class Scraper(object):
 
         headers = {
             "User-Agent": random.choice(user_agent_list),
-            "Cache-Control": "no-cache"
+            "cache-control": "private, max-age=0, no-cache"
         }
 
         url = url.replace("https", "http")
@@ -139,7 +146,7 @@ class Scraper(object):
 
             headers = {
                 "User-Agent": random.choice(user_agent_list),
-                "Cache-Control": "no-cache"
+                "cache-control": "private, max-age=0, no-cache"
             }
 
             response = requests.get(
@@ -160,13 +167,25 @@ class Scraper(object):
                 print("[Debugging] ERROR -> Response is None")
                 return
 
-            # Gets all the possible pages in the catalog
-            pages_el = html.xpath("//div[@id='pagination']/ul/li/a")
-            if pages_el is None or len(pages_el) == 0:
-                page_limit = 1
+            pages_els = html.xpath(
+                "//div[@class='paginatorStyle-root']/div[@class='paginatorStyle-label']")
+
+            if len(pages_els) > 0:
+                el = pages_els[0].text_content().strip()
+                el = el.lstrip("Toplam")
+                el = el.replace("<!---->", "")
+                el = el.rstrip("ürün")
+                el = el.strip()
+                nums = [int(i) for i in el.split("/")]
+                page_limit = math.ceil(nums[1]/nums[0])
             else:
-                # The number of different product pages
-                page_limit = int(pages_el[-1].text)
+                # Gets all the possible pages in the catalog
+                pages_el = html.xpath("//div[@id='pagination']/ul/li/a")
+                if pages_el is None or len(pages_el) == 0:
+                    page_limit = 1
+                else:
+                    # The number of different product pages
+                    page_limit = int(pages_el[-1].text)
 
             if self.mode == "warn" or self.mode == "warn-track":
                 c.execute(f"SELECT listing_id FROM products;")
@@ -182,8 +201,11 @@ class Scraper(object):
                     print(f"[Debugging] Timeout reached on URL {url}")
                     return
 
-                mark = "?" if not "?" in url else "&"
-                current_url = url + f"{mark}sayfa={i}"
+                if page_limit > 1:
+                    mark = "?" if not "?" in url else "&"
+                    current_url = url + f"{mark}sayfa={i}"
+                else:
+                    current_url = url
 
                 response = requests.get(
                     current_url,
@@ -215,33 +237,78 @@ class Scraper(object):
                 # Get the product info
                 a_els = html.xpath("//a[@data-isinstock='True']")
 
-                # Adds all products from this page to the db
-                for a_el, p_name in zip(a_els, p_names):
-                    product_id = a_el.get("data-sku").lower()
-                    listing_id = a_el.get("data-listing_id").lower()
-                    product_price = float(
-                        a_el.get("data-price").replace(",", "."))
-                    product_url = MAIN_URL[:-1] + a_el.get("href")
-                    product_name = p_name.get("title")
-                    date = str(datetime.datetime.now())
+                if len(a_els) == 0:
+                    els = html.xpath(
+                        "//div[@class='product-list']/div[@class='voltran-fragment']\
+                            /div/div/script[@type='text/javascript']")
 
-                    c.execute(
-                        "INSERT INTO products VALUES (%s, %s, %s, %s, %s, %s, %s, %s);", (
-                            date + " |X| " + listing_id,
-                            date,
-                            listing_id,
-                            product_id,
-                            product_name,
-                            product_price,
-                            product_url,
-                            url_id
-                        )
-                    )
+                    if len(els) == 0:
+                        print(f"[Debugging] No products found on URL {url}")
+                        break
 
-                    if self.mode == "warn" or self.mode == "warn-track":
-                        # If this wasn't in the database before, append to the new_products list
-                        if not (listing_id in old_listing_ids) and not (url_id in first_ids):
-                            product = (
+                    data = els[0].text_content()
+                    data = data.strip()
+                    data = data.lstrip("window.MORIA = window.MORIA || \{\};")
+                    data = data.strip()
+                    data = data.lstrip(
+                        "window.MORIA = window.MORIA.ProductList = ")
+                    data = data.replace("'", "\"", 2)
+                    data = json.loads(data.strip())
+
+                    # listing_id, product_id, name, price, url
+                    products = data["STATE"]["data"]["products"]
+                    for product in products:
+                        for variant in product["variantList"]:
+                            product_id = variant["sku"].lower()
+                            name = variant["name"]
+                            product_url = variant["url"] + \
+                                f"?magaza={product['brand']}"
+                            price = float(
+                                variant["listing"]["priceInfo"]["price"])
+                            listing_id = variant["listing"]["listingId"].lower()
+                            date = str(datetime.datetime.now())
+
+                            c.execute(
+                                "INSERT INTO products VALUES (%s, %s, %s, %s, %s, %s, %s, %s);", (
+                                    date + " |X| " + listing_id,
+                                    date,
+                                    listing_id,
+                                    product_id,
+                                    name,
+                                    price,
+                                    product_url,
+                                    url_id
+                                )
+                            )
+
+                            if self.mode == "warn" or self.mode == "warn-track":
+                                # If this wasn't in the database before, append to the new_products list
+                                if not (listing_id in old_listing_ids) and not (url_id in first_ids):
+                                    product = (
+                                        date + " |X| " + listing_id,
+                                        date,
+                                        listing_id,
+                                        product_id,
+                                        name,
+                                        price,
+                                        product_url,
+                                        url_id
+                                    )
+
+                                    self.new_products.append(product)
+                else:
+                    # Adds all products from this page to the db
+                    for a_el, p_name in zip(a_els, p_names):
+                        product_id = a_el.get("data-sku").lower()
+                        listing_id = a_el.get("data-listing_id").lower()
+                        product_price = float(
+                            a_el.get("data-price").replace(",", "."))
+                        product_url = MAIN_URL[:-1] + a_el.get("href")
+                        product_name = p_name.get("title")
+                        date = str(datetime.datetime.now())
+
+                        c.execute(
+                            "INSERT INTO products VALUES (%s, %s, %s, %s, %s, %s, %s, %s);", (
                                 date + " |X| " + listing_id,
                                 date,
                                 listing_id,
@@ -251,8 +318,23 @@ class Scraper(object):
                                 product_url,
                                 url_id
                             )
+                        )
 
-                            self.new_products.append(product)
+                        if self.mode == "warn" or self.mode == "warn-track":
+                            # If this wasn't in the database before, append to the new_products list
+                            if not (listing_id in old_listing_ids) and not (url_id in first_ids):
+                                product = (
+                                    date + " |X| " + listing_id,
+                                    date,
+                                    listing_id,
+                                    product_id,
+                                    product_name,
+                                    product_price,
+                                    product_url,
+                                    url_id
+                                )
+
+                                self.new_products.append(product)
 
             # Make the db know that we completed one more cycle with this URL
             c.execute(
@@ -271,24 +353,43 @@ class Scraper(object):
     def get_products(self, _) -> None:
         """Add products from an URL to the db"""
 
-        start = time.time()
+        try:
 
-        if len(self.url_rows) == 0:
-            return
+            start = time.time()
 
-        if PROXY is not None:
-            print(f"[Debugging] Scraping with proxy {PROXY}...")
-        else:
-            print(f"[Debugging] Scraping with no proxy...")
+            db = self.connect_db()
+            c = db.cursor()
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
-            executor.map(self.url_scraping, self.url_rows)
+            c.execute("SELECT * FROM urls;")
+            url_rows = c.fetchall()
 
-        self.delete_repeated()
+            c.close()
+            self.save_db(db)
 
-        end = time.time()
-        print(
-            f"[Scraper] Cycle completed successfully in {end - start} seconds")
+            if len(url_rows) == 0:
+                print("[Debugging] No URLs to scrape")
+                return
+
+            if PROXY is not None:
+                print(f"[Debugging] Scraping with proxy {PROXY}...")
+            else:
+                print(f"[Debugging] Scraping with no proxy...")
+
+            if BOT_MODE == "scrape":
+                threads = MAX_THREADS
+            else:
+                threads = max(int((3 * MAX_THREADS) / 4), 1)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+                executor.map(self.url_scraping, url_rows)
+
+            self.delete_repeated()
+
+            end = time.time()
+            print(
+                f"[Scraper] Cycle completed successfully in {end - start} seconds")
+        except Exception as e:
+            print(f"[Debugging] Error while scraping URLs -> {e}")
 
     def delete_repeated(self) -> None:
         print("[Bot] Deleting repeated rows...")
@@ -297,14 +398,16 @@ class Scraper(object):
             db = self.connect_db()
             c = db.cursor()
 
-            deleted = self.deleted.copy()
+            c.execute("""
+                DELETE FROM products 
+                WHERE rowid IN (
+                    SELECT product_rowid FROM deleted
+                );
+            """)
 
-            if len(deleted) > 0:
-                marks = ", ".join(["%s" for _ in range(len(deleted))])
-                c.execute(
-                    f"DELETE FROM products WHERE rowid IN ({marks});", deleted)
-
-            self.deleted = []
+            c.execute("""
+                DELETE FROM deleted;
+            """)
 
             time = str(datetime.datetime.now() -
                        datetime.timedelta(minutes=EXPIRE_PRODUCTS))
@@ -329,6 +432,16 @@ class Scraper(object):
         url_ids = [row[0] for row in c.fetchall()]
 
         c.execute(f"DELETE FROM urls WHERE rowid IN ({q_marks});", url_ids)
+        c.execute(f"""
+            DELETE FROM deleted 
+            WHERE product_rowid IN (
+                SELECT rowid 
+                FROM products 
+                WHERE url_id IN (
+                    {q_marks}
+                )
+            );
+        """, url_ids)
         c.execute(
             f"DELETE FROM products WHERE url_id IN ({q_marks});", url_ids)
 
@@ -348,8 +461,9 @@ class Scraper(object):
         db = self.connect_db()
         c = db.cursor()
 
-        c.execute(f"DELETE FROM urls;")
-        c.execute(f"DELETE FROM products;")
+        c.execute("DELETE FROM urls;")
+        c.execute("DELETE FROM products;")
+        c.execute("DELETE FROM deleted;")
 
         c.close()
         self.save_db(db)

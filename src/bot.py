@@ -4,6 +4,7 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, Callb
 
 import telegram
 import mysql.connector
+import concurrent.futures
 import datetime
 import configparser
 import builtins
@@ -17,6 +18,13 @@ config.read("./config.ini")
 
 CHANNEL_ID = config.get("DEFAULT", "channel_id")
 API_KEY = config.get("DEFAULT", "bot_key")
+MAX_THREADS = config.getint("DEFAULT", "threads")
+BOT_MODE = config.get("DEFAULT", "mode").lower()
+
+if not BOT_MODE in ("scrape", "compare", "scrape-compare"):
+    print("[Error] You must provide a valid mode.")
+    print("Valid modes: \"scrape\", \"compare\" and \"scrape-compare\"")
+    sys.exit(1)
 
 DELAY = config.getfloat("TIME", "cycle_delay")
 OLDER_PRODUCTS_RANGE = config.getfloat("TIME", "older_products_range")
@@ -50,7 +58,7 @@ class Bot(object):
         self.mode = None
 
     def connect_db(self) -> None:
-        """Starts a connection to the database""""
+        """Starts a connection to the database"""
 
         return mysql.connector.connect(
             host=DB_HOST,
@@ -65,17 +73,127 @@ class Bot(object):
         db.commit()
         db.close()
 
-    def compare_prices(self, context: CallbackContext) -> None:
-        """Check the database to see if any product is with a low price"""
+    def compare_price(self, args: tuple) -> bool:
+        """Verify if a specific product had a price drop"""
+
+        context = args[0]
+        product_id = args[1]
 
         db = self.connect_db()
         c = db.cursor()
 
         try:
-            job = context.job
+            if len(self.jobs_running) == 0:
+                return
 
-            c.execute("SELECT * FROM urls;")
-            self.scraper.url_rows = c.fetchall()
+            # Get all products from this id that weren't deleted yet
+            c.execute(
+                """
+                SELECT * 
+                FROM products 
+                WHERE product_id = %s AND 
+                rowid NOT IN (
+                    SELECT product_rowid 
+                    FROM deleted
+                ) ORDER BY date DESC;
+                """,
+                (product_id, )
+            )
+            products = c.fetchall()
+
+            old_products = products.copy()
+            new_products = []
+
+            # The max_date a product can have in order to be considered "old"
+            limit = datetime.datetime.strptime(products[-1][1], "%Y-%m-%d %H:%M:%S.%f") + \
+                datetime.timedelta(minutes=OLDER_PRODUCTS_RANGE)
+
+            # Separate "old" from "new" products
+            for i, product in enumerate(products[::-1]):
+                date = datetime.datetime.strptime(
+                    product[1], "%Y-%m-%d %H:%M:%S.%f")
+
+                index = len(products) - i - 1
+                if date > limit:
+                    old_products = products[index+1:]
+                    new_products = products[:index+1]
+                    break
+
+            # If we have only one or even none of the lists, return
+            if len(new_products) == 0 or len(old_products) == 0:
+                c.close()
+                self.save_db(db)
+
+                return True
+
+            older_product = min(old_products, key=lambda x: x[5])
+            current_product = min(new_products, key=lambda x: x[5])
+
+            first_price = older_product[5]
+            current_price = current_product[5]
+            current_date = current_product[1]
+
+            url = current_product[6]
+
+            price_difference = first_price - current_price
+            percentage = price_difference / first_price
+            percentage_str = str("%.2f" % (percentage * 100))
+
+            # If the drop in the price was greater then the expected percentage, warn the user
+            if percentage >= self.percentage:
+                rowid = current_product[0]
+                product_name = current_product[4]
+                product_id = current_product[3]
+
+                print(
+                    f"[Bot] Price of \"{product_name}\" is {percentage_str}% off")
+
+                # If we can get the sellers name in the URL, store it
+                seller = re.match(r"\?magaza=(.*)$", url)
+
+                # If the seller isn't in the URL, get it from the product page
+                if not seller:
+                    info = self.scraper.get_product_info(url)
+                    seller = info["seller"]
+                else:
+                    seller = seller[0]
+
+                message = product_name + "\n\n" + \
+                    "Satıcı: " + seller + "\n\n" + \
+                    str(first_price) + " TL >>>> " + \
+                    str(current_price) + f" TL - {percentage_str}%" + "\n\n" + \
+                    url + "\n\n" + \
+                    MAIN_URL + "ara?q=" + product_id
+
+                context.bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=message
+                )
+
+                c.execute(
+                    "INSERT INTO deleted SELECT rowid FROM products WHERE product_id = %s AND rowid != %s;",
+                    (product_id, rowid)
+                )
+
+            c.close()
+            self.save_db(db)
+
+            return True
+
+        except Exception as e:
+            print(
+                f"[Debugging] Error while comparing price of product_id \"{product_id}\" -> {e}")
+
+            c.close()
+            self.save_db(db)
+
+            return False
+
+    def compare_prices(self, context: CallbackContext) -> None:
+        """Check the database to see if any product is with a low price"""
+
+        try:
+            job = context.job
 
             new_products = self.scraper.new_products.copy()
             self.scraper.new_products = []
@@ -116,6 +234,10 @@ class Bot(object):
 
             if self.mode == "track" or self.mode == "warn-track":
                 print("[Bot] Comparing prices...")
+
+                db = self.connect_db()
+                c = db.cursor()
+
                 c.execute("""SELECT DISTINCT p.product_id  
                              FROM products p 
                              WHERE EXISTS (SELECT 1 
@@ -123,115 +245,28 @@ class Bot(object):
                                            WHERE p.product_id = l.product_id AND p.price <> l.price
                                            );
                 """)
-                prod_rows = c.fetchall()
+                prod_ids = [row[0] for row in c.fetchall()]
 
-                deleted = self.scraper.deleted.copy()
-                marks = ", ".join(["%s" for _ in range(len(deleted))])
-                for row in prod_rows:
-                    if len(self.jobs_running) == 0:
-                        return
+                c.close()
+                self.save_db(db)
 
-                    product_id = row[0]
-
-                    # Get all products from this id that weren't deleted yet
-                    if len(deleted) > 0:
-                        c.execute(
-                            f"SELECT * FROM products WHERE product_id = %s AND rowid NOT IN ({marks}) ORDER BY date DESC;",
-                            (product_id, *deleted)
-                        )
+                if len(prod_ids) > 0:
+                    if BOT_MODE == "compare":
+                        threads = MAX_THREADS
                     else:
-                        c.execute(
-                            f"SELECT * FROM products WHERE product_id = %s ORDER BY date DESC;",
-                            (product_id, *deleted)
-                        )
-                    products = c.fetchall()
+                        threads = max(int(MAX_THREADS / 4), 1)
 
-                    old_products = products.copy()
-                    new_products = []
+                    args = zip(
+                        [context for _ in range(len(prod_ids))],
+                        prod_ids
+                    )
 
-                    # The max_date a product can have in order to be considered "old"
-                    limit = datetime.datetime.strptime(products[-1][1], "%Y-%m-%d %H:%M:%S.%f") + \
-                        datetime.timedelta(minutes=OLDER_PRODUCTS_RANGE)
-
-                    # Separate "old" from "new" products
-                    for i, product in enumerate(products[::-1]):
-                        date = datetime.datetime.strptime(
-                            product[1], "%Y-%m-%d %H:%M:%S.%f")
-
-                        index = len(products) - i - 1
-                        if date > limit:
-                            old_products = products[index+1:]
-                            new_products = products[:index+1]
-                            break
-
-                    # If we have only one or even none of the lists, return
-                    if len(new_products) == 0:
-                        continue
-                    if len(old_products) == 0:
-                        continue
-
-                    older_product = min(old_products, key=lambda x: x[5])
-                    current_product = min(new_products, key=lambda x: x[5])
-
-                    first_price = older_product[5]
-                    current_price = current_product[5]
-                    current_date = current_product[1]
-
-                    url = current_product[6]
-
-                    price_difference = first_price - current_price
-                    percentage = price_difference / first_price
-                    percentage_str = str("%.2f" % (percentage * 100))
-
-                    # If the drop in the price was greater then the expected percentage, warn the user
-                    if percentage >= self.percentage:
-                        rowid = current_product[0]
-                        product_name = current_product[4]
-                        product_id = current_product[3]
-
-                        print(
-                            f"[Bot] Price of \"{product_name}\" is {percentage_str}% off")
-
-                        # If we can get the sellers name in the URL, store it
-                        seller = re.match(r"\?magaza=(.*)$", url)
-
-                        # If the seller isn't in the URL, get it from the product page
-                        if not seller:
-                            info = self.scraper.get_product_info(url)
-                            seller = info["seller"]
-                        else:
-                            seller = seller[0]
-
-                        message = product_name + "\n\n" + \
-                            "Satıcı: " + seller + "\n\n" + \
-                            str(first_price) + " TL >>>> " + \
-                            str(current_price) + f" TL - {percentage_str}%" + "\n\n" + \
-                            url + "\n\n" + \
-                            MAIN_URL + "ara?q=" + product_id
-
-                        context.bot.send_message(
-                            chat_id=CHANNEL_ID,
-                            text=message
-                        )
-
-                        c.execute(
-                            "SELECT rowid FROM products WHERE product_id = %s AND rowid != %s;",
-                            (product_id, rowid)
-                        )
-
-                        # Delete every product with this id with the exception of the last one
-                        rowids = [row[0] for row in c.fetchall()]
-                        self.scraper.deleted += rowids
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+                        executor.map(self.compare_price, args)
 
                 print("[Bot] Prices compared successfuly")
 
-            c.close()
-            self.save_db(db)
-
         except Exception as e:
-            c.close()
-            self.save_db(db)
-
             print(f"[Debugging] Error while comparing prices -> {e}")
 
     def start_bot(self, update: Update, context: CallbackContext) -> None:
@@ -290,22 +325,24 @@ class Bot(object):
             )
             return
 
-        self.jobs_running.append(
-            self.job.run_repeating(
-                self.compare_prices,
-                interval=self.delay,
-                first=5,
-                context=update.message.chat_id
+        if BOT_MODE == "compare" or BOT_MODE == "scrape-compare":
+            self.jobs_running.append(
+                self.job.run_repeating(
+                    self.compare_prices,
+                    interval=self.delay,
+                    first=5,
+                    context=update.message.chat_id
+                )
             )
-        )
 
-        self.jobs_running.append(
-            self.job.run_repeating(
-                self.scraper.get_products,
-                interval=self.delay,
-                first=5
+        if BOT_MODE == "scrape" or BOT_MODE == "scrape-compare":
+            self.jobs_running.append(
+                self.job.run_repeating(
+                    self.scraper.get_products,
+                    interval=self.delay,
+                    first=5
+                )
             )
-        )
 
     def stop_bot(self, update: Update, context: CallbackContext) -> None:
         """Stops tracking price loop"""
@@ -365,31 +402,34 @@ class Bot(object):
         update.message.reply_text(f"URL(s) successfuly removed")
 
     def get_status(self, update: Update, context: CallbackContext) -> None:
-        db = self.connect_db()
-        c = db.cursor()
+        try:
+            db = self.connect_db()
+            c = db.cursor()
 
-        if len(self.jobs_running) == 0:
-            status = "Stopped"
-        else:
-            status = "Running"
+            if len(self.jobs_running) == 0:
+                status = "Stopped"
+            else:
+                status = f"Running with mode {self.mode}"
 
-        percentage = str(self.percentage * 100) + "%"
+            percentage = str(self.percentage * 100) + "%"
 
-        c.execute("SELECT * from urls;")
+            c.execute("SELECT url from urls;")
 
-        urls = [row[1] for row in c.fetchall()]
-        if len(urls) == 0:
-            urls_str = " Empty\n"
-        else:
-            urls_str = "\n - " + "\n - ".join(urls) + "\n"
+            urls = [row[0] for row in c.fetchall()]
+            if len(urls) == 0:
+                urls_str = " Empty\n"
+            else:
+                urls_str = "\n - " + "\n - ".join(urls) + "\n"
 
-        update.message.reply_text(
-            f"Tracker Status: {status}\n" +
-            f"Current Percentage: {percentage}\n" +
-            "URLs:" + urls_str
-        )
+            update.message.reply_text(
+                f"Tracker Status: {status}\n" +
+                f"Current Percentage: {percentage}\n" +
+                f"URLs: {str(len(urls))}"
+            )
 
-        c.close()
+            c.close()
+        except Exception as e:
+            print(e)
 
     def change_percentage(self, update: Update, context: CallbackContext) -> None:
         if len(self.jobs_running) == 0:

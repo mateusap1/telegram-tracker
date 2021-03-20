@@ -20,18 +20,13 @@ db = mysql.connector.connect(
 c = db.cursor()
 
 prices = [
-    [2279, 2279, 2279, 2279, 2279],
-    [None, None, None, 1519, 1519],
-    [None, None, None, None, None]
+    [2279, 2279, 2279, 2279, 2279, 2279, 2279, 2279, 2279, 2279, 2279, 2279],
+    [None, None, None, None, None, None, None, None, None, None, 1519, 1519],
+    [None, None, None, None, None, None, None, None, None, None, None, None]
 ]
-# prices = [
-#     [171.91, 171.91, 171.91, 171.91],
-#     [79.9, 79.9, 79.9, 79.9],
-#     [None, None, None, None]
-# ]
 
-# product_id = "<product_id>" + str(random.randint(1, 1000))
-product_id = "<product_id>"
+rd = str(random.randint(1, 100))
+product_id = "<product_id>" + rd
 product_name = 'Teste'
 product_url = "https://www.hepsiburada.com/lenovo-v14-ill-intel-core-i5-1035g1-8gb-1tb-256gb-ssd-windows-10-home-14-fhd-tasinabilir-bilgisayar-82c400a8txr3-p-HBV00001C8DV3?magaza=Bisistem"
 url_id = 1
@@ -43,7 +38,7 @@ for price1, price2, price3 in zip(*prices):
             "INSERT INTO products VALUES (%s, %s, %s, %s, %s, %s, %s, %s);", (
                 date + " |X| " + "Product1",
                 date,
-                "Product1", 
+                "Product1" + rd, 
                 product_id, 
                 product_name, 
                 price1, 
@@ -57,7 +52,7 @@ for price1, price2, price3 in zip(*prices):
             "INSERT INTO products VALUES (%s, %s, %s, %s, %s, %s, %s, %s);", (
                 date + " |X| " + "Product2",
                 date,
-                "Product2", 
+                "Product2" + rd, 
                 product_id, 
                 product_name, 
                 price2, 
@@ -71,7 +66,7 @@ for price1, price2, price3 in zip(*prices):
             "INSERT INTO products VALUES (%s, %s, %s, %s, %s, %s, %s, %s);", (
                 date + " |X| " + "Product3",
                 date,
-                "Product3", 
+                "Product3" + rd, 
                 product_id, 
                 product_name, 
                 price3, 
@@ -80,7 +75,7 @@ for price1, price2, price3 in zip(*prices):
             )
         )
     
-    date = str(datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S.%f") + datetime.timedelta(seconds = 120))
+    date = str(datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S.%f") + datetime.timedelta(seconds = 61))
 
 c.close()
 db.commit()
