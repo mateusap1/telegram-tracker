@@ -12,6 +12,7 @@ import sys
 import os
 import re
 import time
+import requests
 
 config = configparser.ConfigParser()
 config.read("./config.ini")
@@ -45,7 +46,13 @@ if API_KEY[0] == "$":
 DB_HOST = config.get("DATABASE", "host")
 DB_USER = config.get("DATABASE", "user")
 DB_PASSWORD = config.get("DATABASE", "password")
-DB_NAME = "telegram_tracker"
+DB_NAME = config.get("DATABASE", "name")
+
+MIN_CYCLE_TIME = 60
+MIN_CYCLES = 3
+
+if DB_PASSWORD[0] == "$":
+    DB_PASSWORD = os.getenv(DB_PASSWORD[1:])
 
 
 class Bot(object):
@@ -77,60 +84,220 @@ class Bot(object):
         """Verify if a specific product had a price drop"""
 
         context = args[0]
-        product_id = args[1]
+        products = args[1]
+        urls = args[2]
 
-        db = self.connect_db()
-        c = db.cursor()
+        product_id = products[0][3]
 
         try:
-            if len(self.jobs_running) == 0:
-                return
+            print("Bip")
 
-            # Get all products from this id that weren't deleted yet
-            c.execute(
-                """
-                SELECT * 
-                FROM products 
-                WHERE product_id = %s AND 
-                rowid NOT IN (
-                    SELECT product_rowid 
-                    FROM deleted
-                ) ORDER BY date DESC;
-                """,
-                (product_id, )
-            )
-            products = c.fetchall()
+            temp_products = list(
+                filter(lambda x: x[-1] == "temp_products", products))
+            products = list(filter(lambda x: x[-1] == "products", products))
 
-            old_products = products.copy()
-            new_products = []
+            temp_products = [i[:-1] for i in temp_products]
+            products = [i[:-1] for i in products]
 
-            # The max_date a product can have in order to be considered "old"
-            limit = datetime.datetime.strptime(products[-1][1], "%Y-%m-%d %H:%M:%S.%f") + \
-                datetime.timedelta(minutes=OLDER_PRODUCTS_RANGE)
+            if len(temp_products) == 0:
+                return True
 
-            # Separate "old" from "new" products
-            for i, product in enumerate(products[::-1]):
-                date = datetime.datetime.strptime(
-                    product[1], "%Y-%m-%d %H:%M:%S.%f")
-
-                index = len(products) - i - 1
-                if date > limit:
-                    old_products = products[index+1:]
-                    new_products = products[:index+1]
+            cycles = 0  # The number of cycles the url of the first product had
+            for row in urls:
+                if row[0] == temp_products[0][7]:
+                    cycles = int(row[2])
                     break
 
-            # If we have only one or even none of the lists, return
-            if len(new_products) == 0 or len(old_products) == 0:
+            # The newest temp_product
+            max_time = max(temp_products, key=lambda x: x[1])
+            max_time = datetime.datetime.strptime(
+                max_time[1], "%Y-%m-%d %H:%M:%S.%f"
+            )
+
+            # The oldest temp_product
+            min_time = min(temp_products, key=lambda x: x[1])
+            min_time = datetime.datetime.strptime(
+                min_time[1], "%Y-%m-%d %H:%M:%S.%f"
+            )
+
+            cycle_time = max_time - min_time  # The time it took to get all those products
+
+            if len(products) == 0:  # If this is a new product
+                # If this is not our first cycle and the bot is in the warn mode
+                if (self.mode == "warn" or self.mode == "warn-track") and cycles > 1:
+                    # Verify if new product is from seller "Hepsiburada".
+                    # If it is, warn the user.
+
+                    rowid, date, listing_id, product_id, product_name, \
+                        product_price, product_url, url_id = temp_products[0]
+
+                    # Try to get the seller name by looking on the URL
+                    seller = re.match(r"\?magaza=(.*)$", product_url)
+
+                    # If we couldn't get the name, scrape the product page and get it
+                    if not seller:
+                        info = self.scraper.get_product_info(product_url)
+                        seller = info["seller"]
+                        product_url += "\n\n"
+                    else:
+                        seller = seller[0]
+
+                    # If our seller is Hepsiburada, warn the user
+                    if seller.lower() == "hepsiburada":
+                        message = product_name + "\n\n" + \
+                            str(product_price) + " TL\n\n" + \
+                            product_url
+
+                        context.bot.send_message(
+                            chat_id=CHANNEL_ID,
+                            text=message
+                        )
+
+                db = self.connect_db()
+                c = db.cursor()
+
+                c.execute(f"""
+                    INSERT INTO products (
+                        rowid,
+                        date,
+                        listing_id,
+                        product_id,
+                        product_name,
+                        price,
+                        url,
+                        url_id
+                    ) VALUES {", ".join([str(i) for i in temp_products])};
+                """)
+
+                c.execute("""
+                    DELETE FROM temp_products 
+                    WHERE product_id = %s;
+                """, (product_id, ))
+
                 c.close()
                 self.save_db(db)
 
                 return True
 
-            older_product = min(old_products, key=lambda x: x[5])
-            current_product = min(new_products, key=lambda x: x[5])
+            if self.mode == "warn":
+                db = self.connect_db()
+                c = db.cursor()
 
-            first_price = older_product[5]
-            current_price = current_product[5]
+                c.execute(f"""
+                    INSERT INTO products (
+                        rowid,
+                        date,
+                        listing_id,
+                        product_id,
+                        product_name,
+                        price,
+                        url,
+                        url_id
+                    ) VALUES {", ".join([str(i) for i in temp_products])};
+                """)
+
+                c.execute("""
+                    DELETE FROM temp_products 
+                    WHERE product_id = %s;
+                """, (product_id, ))
+
+                c.close()
+                self.save_db(db)
+
+                return True
+
+            matchs = {}  # A dictionary with every match between old and new listing_ids
+
+            for product in products:
+                listing_id = product[3]
+
+                if listing_id in matchs:
+                    if matchs[listing_id]["old_product"] is not None:
+                        matchs[listing_id]["old_product"] = min(
+                            [product, matchs[listing_id]["old_product"]],
+                            key=lambda x: x[5]
+                        )
+                    else:
+                        matchs[listing_id]["old_product"] = product
+                else:
+                    matchs[listing_id] = {
+                        "old_product": product,
+                        "new_product": None
+                    }
+
+            for product in temp_products:
+                listing_id = product[3]
+
+                if listing_id in matchs:
+                    if matchs[listing_id]["new_product"] is not None:
+                        matchs[listing_id]["new_product"] = min(
+                            [product, matchs[listing_id]["new_product"]],
+                            key=lambda x: x[5]
+                        )
+                    else:
+                        matchs[listing_id]["new_product"] = product
+                else:
+                    matchs[listing_id] = {
+                        "old_product": None,
+                        "new_product": product
+                    }
+
+            for listing_id, (old_product, new_product) in matchs.items():
+                # If we don't have an old product that matches this listing_id
+                # and not enough cycles with this url happened, disconsider this
+                # new product in the price comparison
+                if old_product is None:
+                    url_id = new_product[7]
+
+                    cycles = 0
+                    for row in urls:
+                        if row[0] == url_id:
+                            cycles = int(row[2])
+                            break
+
+                    if cycles < MIN_CYCLES:
+                        temp_products.remove(new_product)
+
+                # If we don't have a new product that matches this listing_id
+                # and we didn't spent enough time in this cycle, return and wait
+                # for a new call
+                if new_product is None:
+                    if cycle_time < MIN_CYCLE_TIME:
+                        return True
+
+            db = self.connect_db()
+            c = db.cursor()
+
+            # Insert the temp_products into the products table
+            c.execute(f"""
+                INSERT INTO products (
+                    rowid,
+                    date,
+                    listing_id,
+                    product_id,
+                    product_name,
+                    price,
+                    url,
+                    url_id
+                ) VALUES {", ".join([str(i) for i in temp_products])};
+            """)
+
+            # Delete the temp_products
+            c.execute("""
+                DELETE FROM temp_products 
+                WHERE product_id = %s;
+            """, (product_id, ))
+
+            c.close()
+            self.save_db(db)
+
+            # Get the cheapest product from `temp_products`
+            current_product = min(temp_products, key=lambda x: x[5])
+            # Get the cheapest product from `products`
+            older_product = min(products, key=lambda x: x[5])
+
+            first_price = older_product[5]  # Cheaper price of `temp_products`
+            current_price = current_product[5]  # Cheaper price of `products`
             current_date = current_product[1]
 
             url = current_product[6]
@@ -170,22 +337,11 @@ class Bot(object):
                     text=message
                 )
 
-                c.execute(
-                    "INSERT INTO deleted SELECT rowid FROM products WHERE product_id = %s AND rowid != %s;",
-                    (product_id, rowid)
-                )
-
-            c.close()
-            self.save_db(db)
-
             return True
 
         except Exception as e:
             print(
-                f"[Debugging] Error while comparing price of product_id \"{product_id}\" -> {e}")
-
-            c.close()
-            self.save_db(db)
+                f"[Debugging] Error {e.__class__} while comparing price of product_id \"{product_id}\" -> {e}")
 
             return False
 
@@ -195,79 +351,64 @@ class Bot(object):
         try:
             job = context.job
 
-            new_products = self.scraper.new_products.copy()
-            self.scraper.new_products = []
+            print("[Bot] Comparing prices...")
 
-            if self.mode == "warn" or self.mode == "warn-track":
-                print("[Bot] Searching for new products...")
+            start = time.time()
 
-                # For each product added to the `new_products` list, verify if they are from
-                # seller "Hepsiburada". If they are, warn the user.
-                for product in new_products:
-                    rowid, date, product_id, listing_id, product_name, \
-                        product_price, product_url, url_id = product
+            db = self.connect_db()
+            c = db.cursor()
 
-                    seller = re.match(r"\?magaza=(.*)$", product_url)
+            # TODO: Get all elements from both tables ordered by product_id and separate them
+            # TODO: Make the connections, the shortest possible
 
-                    if not seller:
-                        info = self.scraper.get_product_info(product_url)
-                        seller = info["seller"]
-                        product_url += "\n\n"
+            c.execute("""
+                SELECT *, 'products' 
+                FROM products 
+                UNION
+                SELECT *, 'temp_products'
+                FROM temp_products
+                ORDER BY product_id;
+            """)
+            products = c.fetchall()
 
+            c.execute("SELECT * FROM urls;")
+            urls = c.fetchall()
+
+            c.close()
+            self.save_db(db)
+
+            if len(products) > 0:
+                if BOT_MODE == "compare":
+                    threads = MAX_THREADS
+                else:
+                    threads = max(int(MAX_THREADS / 4), 1)
+
+                ps = []
+                last_product_id = None
+                for product in products:
+                    if product[3] != last_product_id:
+                        ps.append([product])
                     else:
-                        seller = seller[0]
-                        product_url += "?magaza=Hepsiburada\n\n"
+                        ps[-1].append(product)
 
-                    if seller.lower() != "hepsiburada":
-                        continue
+                    last_product_id = product[3]
 
-                    message = product_name + "\n\n" + \
-                        str(product_price) + " TL\n\n" + \
-                        product_url
+                args = zip(
+                    [context for _ in range(len(ps))],
+                    ps,
+                    [urls for _ in range(len(ps))]
+                )
 
-                    context.bot.send_message(
-                        chat_id=CHANNEL_ID,
-                        text=message
-                    )
+                with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+                    executor.map(self.compare_price, args)
 
-                print("[Bot] Products were searched successfully")
-
-            if self.mode == "track" or self.mode == "warn-track":
-                print("[Bot] Comparing prices...")
-
-                db = self.connect_db()
-                c = db.cursor()
-
-                c.execute("""SELECT DISTINCT p.product_id  
-                             FROM products p 
-                             WHERE EXISTS (SELECT 1 
-                                           FROM products l 
-                                           WHERE p.product_id = l.product_id AND p.price <> l.price
-                                           );
-                """)
-                prod_ids = [row[0] for row in c.fetchall()]
-
-                c.close()
-                self.save_db(db)
-
-                if len(prod_ids) > 0:
-                    if BOT_MODE == "compare":
-                        threads = MAX_THREADS
-                    else:
-                        threads = max(int(MAX_THREADS / 4), 1)
-
-                    args = zip(
-                        [context for _ in range(len(prod_ids))],
-                        prod_ids
-                    )
-
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-                        executor.map(self.compare_price, args)
-
-                print("[Bot] Prices compared successfuly")
+            duration = time.time() - start
+            print(
+                f"[Bot] Prices compared successfuly in {duration} seconds")
 
         except Exception as e:
-            print(f"[Debugging] Error while comparing prices -> {e}")
+            print(
+                f"[Debugging] Error {e.__class__} while comparing prices -> {e}")
 
     def start_bot(self, update: Update, context: CallbackContext) -> None:
         """Message the user when the price is low"""
@@ -376,7 +517,7 @@ class Bot(object):
 
         for i, url in enumerate(urls):
             c.execute("INSERT INTO urls VALUES (%s, %s, %s);",
-                      (i+size, url, 1))
+                      (i+size, url, 0))
 
         c.close()
         self.save_db(db)
