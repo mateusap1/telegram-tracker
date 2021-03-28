@@ -49,7 +49,7 @@ DB_PASSWORD = config.get("DATABASE", "password")
 DB_NAME = config.get("DATABASE", "name")
 
 MIN_CYCLE_TIME = 60
-MIN_CYCLES = 3
+MIN_CYCLES = 10
 
 if DB_PASSWORD[0] == "$":
     DB_PASSWORD = os.getenv(DB_PASSWORD[1:])
@@ -80,6 +80,36 @@ class Bot(object):
         db.commit()
         db.close()
 
+    def replace_products(self, temp_products: list, product_id: str) -> None:
+        """Insert new products into 'products' table and 
+            delete them from 'temp_products' table"""
+
+        db = self.connect_db()
+        c = db.cursor()
+
+        # Add new products to 'products' table
+        c.execute(f"""
+            INSERT INTO products (
+                rowid,
+                date,
+                listing_id,
+                product_id,
+                product_name,
+                price,
+                url,
+                url_id
+            ) VALUES {", ".join([str(i) for i in temp_products])};
+        """)
+
+        # Remove new products from 'temp_products' table
+        c.execute("""
+            DELETE FROM temp_products 
+            WHERE product_id = %s;
+        """, (product_id, ))
+
+        c.close()
+        self.save_db(db)
+
     def compare_price(self, args: tuple) -> bool:
         """Verify if a specific product had a price drop"""
 
@@ -90,8 +120,6 @@ class Bot(object):
         product_id = products[0][3]
 
         try:
-            print("Bip")
-
             temp_products = list(
                 filter(lambda x: x[-1] == "temp_products", products))
             products = list(filter(lambda x: x[-1] == "products", products))
@@ -99,7 +127,7 @@ class Bot(object):
             temp_products = [i[:-1] for i in temp_products]
             products = [i[:-1] for i in products]
 
-            if len(temp_products) == 0:
+            if len(temp_products) == 0:  # If we don't have new products, return
                 return True
 
             cycles = 0  # The number of cycles the url of the first product had
@@ -120,7 +148,7 @@ class Bot(object):
                 min_time[1], "%Y-%m-%d %H:%M:%S.%f"
             )
 
-            cycle_time = max_time - min_time  # The time it took to get all those products
+            cycle_time = max_time - min_time  # The time it took to get all those new products
 
             if len(products) == 0:  # If this is a new product
                 # If this is not our first cycle and the bot is in the warn mode
@@ -153,109 +181,78 @@ class Bot(object):
                             text=message
                         )
 
-                db = self.connect_db()
-                c = db.cursor()
-
-                c.execute(f"""
-                    INSERT INTO products (
-                        rowid,
-                        date,
-                        listing_id,
-                        product_id,
-                        product_name,
-                        price,
-                        url,
-                        url_id
-                    ) VALUES {", ".join([str(i) for i in temp_products])};
-                """)
-
-                c.execute("""
-                    DELETE FROM temp_products 
-                    WHERE product_id = %s;
-                """, (product_id, ))
-
-                c.close()
-                self.save_db(db)
+                self.replace_products(temp_products, product_id)
 
                 return True
 
-            if self.mode == "warn":
-                db = self.connect_db()
-                c = db.cursor()
-
-                c.execute(f"""
-                    INSERT INTO products (
-                        rowid,
-                        date,
-                        listing_id,
-                        product_id,
-                        product_name,
-                        price,
-                        url,
-                        url_id
-                    ) VALUES {", ".join([str(i) for i in temp_products])};
-                """)
-
-                c.execute("""
-                    DELETE FROM temp_products 
-                    WHERE product_id = %s;
-                """, (product_id, ))
-
-                c.close()
-                self.save_db(db)
+            if self.mode == "warn":  # If we are not interested in price drops
+                self.replace_products(temp_products, product_id)
 
                 return True
 
             matchs = {}  # A dictionary with every match between old and new listing_ids
 
-            for product in products:
+            for product in products:  # Going over each "old" product
                 listing_id = product[3]
 
-                if listing_id in matchs:
+                if listing_id in matchs:  # If we've already went over this listing_id
                     if matchs[listing_id]["old_product"] is not None:
+                        # If we already have an old product there and this product is
+                        # cheaper, replace it with this one
+
                         matchs[listing_id]["old_product"] = min(
                             [product, matchs[listing_id]["old_product"]],
                             key=lambda x: x[5]
                         )
-                    else:
+                    else:  # If we have no products on the match dictionary, insert this one
                         matchs[listing_id]["old_product"] = product
-                else:
+                else:  # If we have no matchs with this listing_id, create one
                     matchs[listing_id] = {
                         "old_product": product,
                         "new_product": None
                     }
 
-            for product in temp_products:
+            for product in temp_products:  # Going over each "new" product
                 listing_id = product[3]
 
-                if listing_id in matchs:
+                if listing_id in matchs:  # If we already have a match with this listing_id
                     if matchs[listing_id]["new_product"] is not None:
+                        # If we already have a new product there and this product is
+                        # cheaper, replace it with this one
+
                         matchs[listing_id]["new_product"] = min(
                             [product, matchs[listing_id]["new_product"]],
                             key=lambda x: x[5]
                         )
-                    else:
+                    else:  # If we have no products on the match dictionary, insert this one
                         matchs[listing_id]["new_product"] = product
-                else:
+                else:  # If we have no matchs with this listing_id, create one
                     matchs[listing_id] = {
                         "old_product": None,
                         "new_product": product
                     }
 
             for listing_id, (old_product, new_product) in matchs.items():
-                # If we don't have an old product that matches this listing_id
-                # and not enough cycles with this url happened, disconsider this
-                # new product in the price comparison
+                # Going over the matches. Each one of them
+                # should have at least an old or new product
+
                 if old_product is None:
+                    # If we don't have an old product that matches this listing_id
+                    # and not enough cycles with this url happened, disconsider this
+                    # new product in the price comparison
+
                     url_id = new_product[7]
 
-                    cycles = 0
+                    cycles = 0  # Number of cycles that happened with this new products URL
                     for row in urls:
                         if row[0] == url_id:
                             cycles = int(row[2])
                             break
 
                     if cycles < MIN_CYCLES:
+                        # If the number of cycles is less then the minimum,
+                        # disconsider this product
+
                         temp_products.remove(new_product)
 
                 # If we don't have a new product that matches this listing_id
@@ -265,45 +262,21 @@ class Bot(object):
                     if cycle_time < MIN_CYCLE_TIME:
                         return True
 
-            db = self.connect_db()
-            c = db.cursor()
+            self.replace_products(temp_products, product_id)
 
-            # Insert the temp_products into the products table
-            c.execute(f"""
-                INSERT INTO products (
-                    rowid,
-                    date,
-                    listing_id,
-                    product_id,
-                    product_name,
-                    price,
-                    url,
-                    url_id
-                ) VALUES {", ".join([str(i) for i in temp_products])};
-            """)
-
-            # Delete the temp_products
-            c.execute("""
-                DELETE FROM temp_products 
-                WHERE product_id = %s;
-            """, (product_id, ))
-
-            c.close()
-            self.save_db(db)
-
-            # Get the cheapest product from `temp_products`
+            # Get the cheapest new product
             current_product = min(temp_products, key=lambda x: x[5])
-            # Get the cheapest product from `products`
+            # Get the cheapest old product
             older_product = min(products, key=lambda x: x[5])
 
-            first_price = older_product[5]  # Cheaper price of `temp_products`
-            current_price = current_product[5]  # Cheaper price of `products`
+            current_price = current_product[5]  # Cheaper price of new products
+            old_price = older_product[5]  # Cheaper price of old products
             current_date = current_product[1]
 
             url = current_product[6]
 
-            price_difference = first_price - current_price
-            percentage = price_difference / first_price
+            price_difference = old_price - current_price
+            percentage = price_difference / old_price
             percentage_str = str("%.2f" % (percentage * 100))
 
             # If the drop in the price was greater then the expected percentage, warn the user
@@ -312,22 +285,15 @@ class Bot(object):
                 product_name = current_product[4]
                 product_id = current_product[3]
 
+                date = str(datetime.datetime.now())
+
                 print(
-                    f"[Bot] Price of \"{product_name}\" is {percentage_str}% off")
-
-                # If we can get the sellers name in the URL, store it
-                seller = re.match(r"\?magaza=(.*)$", url)
-
-                # If the seller isn't in the URL, get it from the product page
-                if not seller:
-                    info = self.scraper.get_product_info(url)
-                    seller = info["seller"]
-                else:
-                    seller = seller[0]
+                    f"[Bot] [{date}] Price of \"{product_name}\", scraped on {current_date}," +
+                    f" is {percentage_str}% off"
+                )
 
                 message = product_name + "\n\n" + \
-                    "Satıcı: " + seller + "\n\n" + \
-                    str(first_price) + " TL >>>> " + \
+                    str(old_price) + " TL >>>> " + \
                     str(current_price) + f" TL - {percentage_str}%" + "\n\n" + \
                     url + "\n\n" + \
                     MAIN_URL + "ara?q=" + product_id
@@ -349,8 +315,6 @@ class Bot(object):
         """Check the database to see if any product is with a low price"""
 
         try:
-            job = context.job
-
             print("[Bot] Comparing prices...")
 
             start = time.time()
@@ -358,9 +322,7 @@ class Bot(object):
             db = self.connect_db()
             c = db.cursor()
 
-            # TODO: Get all elements from both tables ordered by product_id and separate them
-            # TODO: Make the connections, the shortest possible
-
+            # Get all old and new products
             c.execute("""
                 SELECT *, 'products' 
                 FROM products 
@@ -371,21 +333,31 @@ class Bot(object):
             """)
             products = c.fetchall()
 
+            # Get all URLs
             c.execute("SELECT * FROM urls;")
             urls = c.fetchall()
 
             c.close()
             self.save_db(db)
 
-            if len(products) > 0:
+            if len(products) > 0:  # If we have at least one product in the DB
                 if BOT_MODE == "compare":
+                    # If the sole purpouse of this bot is to compare,
+                    # use all possible threads
+
                     threads = MAX_THREADS
                 else:
+                    # If this bot is used both to scrape and compare, use 1/4 of the threads
+
                     threads = max(int(MAX_THREADS / 4), 1)
 
+                # Products, but each list is from a different product_id.
                 ps = []
-                last_product_id = None
+                last_product_id = None  # Last product_id found
                 for product in products:
+                    # If we have a different product ID than te last one,
+                    # create a new list inside 'ps'. Otherwise, continue the last list
+
                     if product[3] != last_product_id:
                         ps.append([product])
                     else:
@@ -393,6 +365,7 @@ class Bot(object):
 
                     last_product_id = product[3]
 
+                # Arguments that will be passed to the multithreading executor
                 args = zip(
                     [context for _ in range(len(ps))],
                     ps,
