@@ -1,7 +1,9 @@
 import random
+import urllib
 import math
 import sys
 import os
+import re
 import time
 import json
 import requests
@@ -63,6 +65,25 @@ class Scraper(object):
         self.new_products = []
         self.url_rows = []
 
+        self.update_headers()
+        self.proxies = None
+
+        if PROXY is not None:
+            self.proxies = {
+                "http": PROXY,
+                "https": PROXY
+            }
+
+    def update_headers(self):
+        """Update or add the headers in such a way that the website thinks we're 
+        in a Browser and that it doesn't return cached data"""
+
+        self.headers = {
+            "User-Agent": random.choice(user_agent_list),
+            "cache-control": "private, max-age=0, no-cache",
+            "Pragma": "no-cache"
+        }
+
     def connect_db(self) -> None:
         return mysql.connector.connect(
             host=DB_HOST,
@@ -77,36 +98,29 @@ class Scraper(object):
         db.commit()
         db.close()
 
+    def parse_data(self, response):
+        """Parse the data into an lxml.html object. 
+        Returns None, if there was any error"""
+
+        if response is not None:  # If the response is valid
+            if response.status_code == 200:  # If we received a success status
+                return lxml.html.fromstring(response.content)
+            else:  # If not, display an error in the terminal and return None
+                print(
+                    f"[Debugging] HTTP error {response.status_code}")
+                return None
+        else:  # If there was no response given, display an error and return None
+            print("[Debugging] Error while parsing data -> Response is None")
+            return None
+
     def get_product_info(self, url: str) -> dict:
         """Returns the price and the seller name of a product based on the URL given"""
 
-        if PROXY is not None:
-            proxies = {
-                "http": PROXY,
-                "https": PROXY
-            }
-        else:
-            proxies = None
-
-        headers = {
-            "User-Agent": random.choice(user_agent_list),
-            "cache-control": "private, max-age=0, no-cache",
-            "Pragma": "no-cache"
-        }
-
-        url = url.replace("https", "http")
-
-        response = requests.get(url, headers=headers, proxies=proxies)
-
-        if response is not None:
-            if response.status_code == 200:
-                html = lxml.html.fromstring(response.content)
-            else:
-                print(
-                    f"[Debugging] HTTP error {response.status_code} in URL {URL_name}")
-                return None
-        else:
-            print("[Debugging] ERROR -> Response is None")
+        self.update_headers()
+        response = requests.get(
+            url, headers=self.headers, proxies=self.proxies)
+        html = self.parse_data(response)
+        if html is None:
             return None
 
         # Gets the price from the product page
@@ -128,6 +142,229 @@ class Scraper(object):
             "seller": seller
         }
 
+    def page_scraping(self, url: str, page_type: str, url_id: int) -> list:
+        """Get all products in the URL specified and save it 
+        into the DB, as well as, return it's information"""
+
+        if page_type is None:
+            print(
+                f"[Debugging] Error while scraping the page {url} -> No page type provided")
+            return None
+
+        response = requests.get(
+            url,
+            headers=self.headers,
+            proxies=self.proxies,
+            timeout=TIMEOUT
+        )
+
+        html = self.parse_data(response)
+        if html is None:
+            print(
+                f"[Debugging] Error while scraping the page {url} -> HTML parisng failed")
+            return None
+
+        # Get the product name
+        p_names = html.xpath("//h3[@class='product-title title']")
+
+        # Get the product info
+        a_els = html.xpath("//a[@data-isinstock='True']")
+
+        products = []  # The list containing all products information
+
+        if page_type == "AJAX":
+            # Get the <script /> element that has all products data stored
+            els = html.xpath(
+                "//div[@class='product-list']/div[@class='voltran-fragment']\
+                    /div/div/script[@type='text/javascript']")
+
+            if len(els) == 0:  # If no products were found, return an empty list
+                return []
+
+            # Filter the data inside <script />
+            data = els[0].text_content()
+            data = data.strip()
+            data = data.lstrip("window.MORIA = window.MORIA || \{\};")
+            data = data.strip()
+            data = data.lstrip(
+                "window.MORIA = window.MORIA.ProductList = ")
+            data = data.replace("'", "\"", 2)
+
+            # Transform the filtered data into a JSON string
+            data = json.loads(data.strip())
+
+            db = self.connect_db()
+            c = db.cursor()
+
+            # Access `products` inside the JSON string
+            products = data["STATE"]["data"]["products"]
+
+            for product in products:  # For each dictionary containing a product information
+                # For each variant of this product
+                for variant in product["variantList"]:
+                    # The dictionary where this variants information will be stored
+                    info = {}
+
+                    # Get the current date, so we can know when this price was scraped
+                    info["date"] = str(datetime.datetime.now())
+
+                    # Get this variants listing ID
+                    info["listing_id"] = variant["listing"]["listingId"].lower()
+
+                    # The rowid should be unique to each product, because of this,
+                    # it's a concatanation between the date and the listing_id
+                    info["rowid"] = hash(info["date"] + info["listing_id"])
+
+                    # Get the product ID
+                    info["product_id"] = variant["sku"].lower()
+
+                    # Get the name of this product
+                    info["name"] = variant["name"]
+
+                    # Get the seller of this variation name
+                    info["seller"] = variant["listing"]["merchantName"]
+
+                    # Get the URL of this product
+                    info["product_url"] = variant["url"]
+
+                    # Get the price of this variation
+                    info["price"] = float(
+                        variant["listing"]["priceInfo"]["price"])
+                    
+                    info["url_id"] = url_id
+
+                    db = self.connect_db()
+                    c = db.cursor()
+
+                    c.execute("""
+                        INSERT INTO temp_products 
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+                    """, (
+                        info["rowid"],
+                        info["date"],
+                        info["listing_id"],
+                        info["product_id"],
+                        info["name"],
+                        info["seller"],
+                        info["price"],
+                        info["product_url"],
+                        info["url_id"]
+                    ))
+
+                    products.append(info)
+
+                    c.close()
+                    self.save_db(db)
+
+        elif page_type == "normal":
+            # Get all possible <script /> elements
+            script_els = html.xpath("//script[@type='text/javascript']")
+
+            # If no <script /> elements were found, return an empty list
+            if len(script_els) == 0:
+                return []
+
+            data = None  # The json string that will contain the products data
+
+            # Go over each of the script elements and try to find the JS variable there
+            for el in script_els:
+                # If we can find the variable, get store the information
+                if "var utagData" in el.text_content():
+                    # Filter the data inside <script />
+                    data = el.text_content()
+                    data = data.strip()
+                    data = data.split("\n")[0]
+                    data = data.strip()
+                    data = data.lstrip("var utagData = ")
+                    data = data.rstrip(";")
+
+                    # Transform the filtered data into a JSON string
+                    data = json.loads(data.strip())
+
+                    break
+
+            if data is None:  # If no variable was found, return None
+                print(
+                    f"[Debugging] Error while scraping the page {url} ->" +
+                    "No variable \"utagData\" was found"
+                )
+
+                return None
+
+            names = data["product_names"]
+            prices = data["product_prices"]
+            sellers = data["merchant_names"]
+            listing_ids = data["listing_ids"]
+
+            # Product skus is what we call "product_id" in the database
+            product_skus = data["product_skus"]
+
+            # We need this info so we can get the product URL
+            product_ids = data["product_ids"]
+
+            for i in range(len(names)):
+                # The dictionary where this variants information will be stored
+                info = {}
+
+                # Get the current date, so we can know when this price was scraped
+                info["date"] = str(datetime.datetime.now())
+
+                # Get this variants listing ID
+                info["listing_id"] = listing_ids[i].lower()
+
+                # The rowid should be unique to each product, because of this,
+                # it's a concatanation between the date and the listing_id
+                info["rowid"] = hash(info["date"] + info["listing_id"])
+
+                # Get the product ID
+                info["product_id"] = product_skus[i].lower()
+
+                # Get the name of this product
+                info["name"] = names[i]
+
+                info["price"] = float(prices[i])
+
+                # Get the seller of this variation name
+                info["seller"] = sellers[i]
+
+                # Get the URL of this product, which is: the hepsiburada main URL plus
+                # the name of the product in lowercase with hifens instead of spaces plus
+                # "-p-<product_id>" in the end
+                info["product_url"] = "https://www.hepsiburada.com/"
+                
+                info["url_id"] = url_id
+
+                db = self.connect_db()
+                c = db.cursor()
+
+                c.execute("""
+                    INSERT INTO temp_products 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+                """, (
+                    info["rowid"],
+                    info["date"],
+                    info["listing_id"],
+                    info["product_id"],
+                    info["name"],
+                    info["seller"],
+                    info["price"],
+                    info["product_url"],
+                    info["url_id"]
+                ))
+
+                products.append(info)
+
+                c.close()
+                self.save_db(db)
+
+        # If the page type is neither "AJAX" nor "normal", return None indicating an error
+        else:
+            print(
+                f"[Debugging] Error while scraping the page {url} -> Page type invalid")
+            return None
+
+        return products
+
     def url_scraping(self, row):
         """Based on a given URL, adds the products data to the database of every page it can find"""
 
@@ -139,56 +376,55 @@ class Scraper(object):
 
             print(f"[Scraper] URL {url} is being scraped...")
 
-            if PROXY is not None:
-                proxies = {
-                    "http": PROXY,
-                    "https": PROXY
-                }
-            else:
-                proxies = None
+            self.update_headers()
 
-            headers = {
-                "User-Agent": random.choice(user_agent_list),
-                "cache-control": "private, max-age=0, no-cache",
-                "Pragma": "no-cache"
-            }
-
+            # Get the content of the URL we were given
             response = requests.get(
                 url,
-                headers=headers,
-                proxies=proxies,
+                headers=self.headers,
+                proxies=self.proxies,
                 timeout=TIMEOUT
             )
 
-            if response is not None:
-                if response.status_code == 200:
-                    html = lxml.html.fromstring(response.content)
-                else:
-                    print(
-                        f"[Debugging] HTTP error {response.status_code} in URL {url}")
-                    return
-            else:
-                print("[Debugging] ERROR -> Response is None")
-                return
+            html = self.parse_data(response)
+            if html is None:
+                return None
 
+            # NUmber of products in total if we are in an AJAX page
             pages_els = html.xpath(
                 "//div[@class='paginatorStyle-root']/div[@class='paginatorStyle-label']")
 
-            if len(pages_els) > 0:
+            page_type = None  # If our page type AJAX or normal
+
+            if len(pages_els) > 0:  # If we are in an AJAX page
+                # Change our page type
+                page_type = "AJAX"
+
+                # Filter the content to get only two number
                 el = pages_els[0].text_content().strip()
                 el = el.lstrip("Toplam")
                 el = el.replace("<!---->", "")
                 el = el.rstrip("ürün")
                 el = el.strip()
+
+                # The first number is the number of products in the
+                # first page and the second, the number of products in total
                 nums = [int(i) for i in el.split("/")]
+
+                # Get the page limit by dividing the number of
+                # products in the first page by the total number
                 page_limit = math.ceil(nums[1]/nums[0])
-            else:
+            else:  # If we are in a normal page
+                # Change our page type
+                page_type = "normal"
+
                 # Gets all the possible pages in the catalog
                 pages_el = html.xpath("//div[@id='pagination']/ul/li/a")
-                if pages_el is None or len(pages_el) == 0:
+
+                # If there's no such element, we are in a single page catalog
+                if len(pages_el) == 0:
                     page_limit = 1
-                else:
-                    # The number of different product pages
+                else:  # Otherwise, get the number of different pages
                     page_limit = int(pages_el[-1].text)
 
             # For each of the possible pages, get the products info and add them to the db
@@ -198,116 +434,14 @@ class Scraper(object):
                     print(f"[Debugging] Timeout reached on URL {url}")
                     return
 
-                if page_limit > 1:
-                    mark = "?" if not "?" in url else "&"
-                    current_url = url + f"{mark}sayfa={i}"
-                else:
-                    current_url = url
+                # If we already have an argument in the URL,
+                # we should use '&', otherwise use '?'
+                mark = "?" if not "?" in url else "&"
 
-                response = requests.get(
-                    current_url,
-                    headers=headers,
-                    proxies=proxies,
-                    timeout=TIMEOUT
-                )
+                # The current page URL
+                current_url = url + f"{mark}sayfa={i}"
 
-                if not response is None:
-                    if response.status_code == 200:
-                        html = lxml.html.fromstring(response.content)
-                    else:
-                        print(
-                            f"[Debugging] HTTP error {response.status_code} in URL {current_url}")
-                        continue
-                else:
-                    print("[Debugging] ERROR -> Response is None")
-                    continue
-
-                # Get the product name
-                p_names = html.xpath("//h3[@class='product-title title']")
-
-                # Get the product info
-                a_els = html.xpath("//a[@data-isinstock='True']")
-
-                if len(a_els) == 0:
-                    els = html.xpath(
-                        "//div[@class='product-list']/div[@class='voltran-fragment']\
-                            /div/div/script[@type='text/javascript']")
-
-                    if len(els) == 0:
-                        print(
-                            f"[Debugging] No products found on URL {url} page {i}")
-                        continue
-
-                    data = els[0].text_content()
-                    data = data.strip()
-                    data = data.lstrip("window.MORIA = window.MORIA || \{\};")
-                    data = data.strip()
-                    data = data.lstrip(
-                        "window.MORIA = window.MORIA.ProductList = ")
-                    data = data.replace("'", "\"", 2)
-                    data = json.loads(data.strip())
-
-                    db = self.connect_db()
-                    c = db.cursor()
-
-                    # listing_id, product_id, name, price, url
-                    products = data["STATE"]["data"]["products"]
-                    for product in products:
-                        for variant in product["variantList"]:
-                            product_id = variant["sku"].lower()
-                            name = variant["name"]
-                            product_url = variant["url"] + \
-                                f"?magaza={product['brand']}"
-                            price = float(
-                                variant["listing"]["priceInfo"]["price"])
-                            listing_id = variant["listing"]["listingId"].lower(
-                            )
-                            date = str(datetime.datetime.now())
-
-                            c.execute(
-                                "INSERT INTO temp_products VALUES (%s, %s, %s, %s, %s, %s, %s, %s);", (
-                                    date + " |X| " + listing_id,
-                                    date,
-                                    listing_id,
-                                    product_id,
-                                    name,
-                                    price,
-                                    product_url,
-                                    url_id
-                                )
-                            )
-                    
-                    c.close()
-                    self.save_db(db)
-                else:
-                    db = self.connect_db()
-                    c = db.cursor()
-
-                    # Adds all products from this page to the db
-                    for a_el, p_name in zip(a_els, p_names):
-                        product_id = a_el.get("data-sku").lower()
-                        listing_id = a_el.get("data-listing_id").lower()
-                        product_price = float(
-                            a_el.get("data-price").replace(",", "."))
-                        product_url = MAIN_URL[:-1] + a_el.get("href")
-                        product_name = p_name.get("title")
-                        date = str(datetime.datetime.now())
-
-                        c.execute(
-                            "INSERT INTO temp_products VALUES (%s, %s, %s, %s, %s, %s, %s, %s);", (
-                                date + " |X| " + listing_id,
-                                date,
-                                listing_id,
-                                product_id,
-                                product_name,
-                                product_price,
-                                product_url,
-                                url_id
-                            )
-                        )
-                    
-                    c.close()
-                    self.save_db(db)
+                info = self.page_scraping(current_url, url_id, page_type)
 
             db = self.connect_db()
             c = db.cursor()
@@ -322,7 +456,8 @@ class Scraper(object):
             print(f"[Scraper] URL {url} was successfully scraped")
 
         except Exception as e:
-            print(f"[Debugging] Error {e.__class__} while scraping URL {url} -> \"{e}\"")
+            print(
+                f"[Debugging] Error {e.__class__} while scraping URL {url} -> \"{e}\"")
 
     def get_products(self, _=None) -> None:
         """Add products from an URL to the db"""
@@ -460,4 +595,7 @@ class Scraper(object):
 
 if __name__ == "__main__":
     scraper = Scraper()
-    scraper.clean_db()
+    # scraper.clean_db()
+
+    url = "https://www.hepsiburada.com/jbl/bluetooth-hoparlorler-c-60004557"
+    print(scraper.page_scraping(url, "normal", 1))
