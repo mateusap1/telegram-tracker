@@ -406,6 +406,13 @@ class Scraper(object):
             """)
 
             c.execute("""
+                DELETE FROM temp_products 
+                WHERE rowid IN (
+                    SELECT product_rowid FROM deleted
+                );
+            """)
+
+            c.execute("""
                 DELETE FROM deleted;
             """)
 
@@ -444,6 +451,8 @@ class Scraper(object):
         """, url_ids)
         c.execute(
             f"DELETE FROM products WHERE url_id IN ({q_marks});", url_ids)
+        c.execute(
+            f"DELETE FROM temp_products WHERE url_id IN ({q_marks});", url_ids)
 
         c.close()
         self.save_db(db)
@@ -463,6 +472,7 @@ class Scraper(object):
 
         c.execute("DELETE FROM urls;")
         c.execute("DELETE FROM products;")
+        c.execute("DELETE FROM temp_products;")
         c.execute("DELETE FROM deleted;")
 
         c.close()

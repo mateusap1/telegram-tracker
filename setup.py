@@ -46,6 +46,18 @@ mycursor.execute("""CREATE TABLE products (
 );
 """)
 
+mycursor.execute("""CREATE TABLE temp_products (
+    rowid TEXT,
+    date TEXT,
+    listing_id TEXT,
+    product_id TEXT,
+    product_name TEXT,
+    price REAL,
+    url TEXT,
+    url_id INTEGER
+);
+""")
+
 mycursor.execute("""CREATE TABLE deleted (
     product_rowid TEXT
 );
