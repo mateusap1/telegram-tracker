@@ -40,11 +40,12 @@ mydb = mysql.connector.connect(
 mycursor = mydb.cursor()
 
 mycursor.execute("""CREATE TABLE products (
-    rowid TEXT,
+    rowid BIGINT,
     date TEXT,
     listing_id TEXT,
     product_id TEXT,
     product_name TEXT,
+    seller TEXT,
     price REAL,
     url TEXT,
     url_id INTEGER
@@ -52,11 +53,12 @@ mycursor.execute("""CREATE TABLE products (
 """)
 
 mycursor.execute("""CREATE TABLE temp_products (
-    rowid TEXT,
+    rowid BIGINT,
     date TEXT,
     listing_id TEXT,
     product_id TEXT,
     product_name TEXT,
+    seller TEXT,
     price REAL,
     url TEXT,
     url_id INTEGER
